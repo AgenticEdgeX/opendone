@@ -1,0 +1,5 @@
+node_modules/
+*.pem
+receipts.json
+*.tmp
+.DS_Store

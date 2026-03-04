@@ -1,0 +1,32 @@
+{
+  "name": "opendone",
+  "version": "0.3.0",
+  "description": "A portable standard for machine-verifiable AI agent task completion",
+  "main": "opendone.js",
+  "bin": {
+    "opendone": "./opendone.js"
+  },
+  "scripts": {
+    "test": "node test.js"
+  },
+  "keywords": [
+    "ai-agents",
+    "verification",
+    "task-completion",
+    "guardrails",
+    "audit",
+    "mcp",
+    "open-standard",
+    "trust"
+  ],
+  "author": "AgenticEdgeX",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/agenticedgex/opendone.git"
+  },
+  "homepage": "https://github.com/agenticedgex/opendone#readme",
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
