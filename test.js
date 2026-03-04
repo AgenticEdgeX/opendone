@@ -279,7 +279,7 @@ console.log('\nStorage');
 // ─────────────────────────────────────────────────────────────
 
 test('fileStore persists and queries receipts', () => {
-  const tmp = `/tmp/od_test_${Date.now()}.json`;
+  const tmp = require("os").tmpdir() + `/od_test_${Date.now()}.json`;
   const store = OpenDone.fileStore(tmp);
   
   const c = OpenDone.contract({ task: 'test', criteria: { required: ['x'] } });
