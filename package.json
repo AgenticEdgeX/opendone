@@ -4,10 +4,12 @@
   "description": "A portable standard for machine-verifiable AI agent task completion",
   "main": "opendone.js",
   "bin": {
-    "opendone": "./opendone.js"
+    "opendone": "opendone.js"
   },
   "scripts": {
-    "test": "node test.js"
+    "test": "node test.js && node test-coram.js",
+    "test:core": "node test.js",
+    "test:coram": "node test-coram.js"
   },
   "keywords": [
     "ai-agents",
@@ -17,13 +19,17 @@
     "audit",
     "mcp",
     "open-standard",
-    "trust"
+    "trust",
+    "coram",
+    "witness-record",
+    "receipt",
+    "contract"
   ],
   "author": "AgenticEdgeX",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/agenticedgex/opendone.git"
+    "url": "git+https://github.com/agenticedgex/opendone.git"
   },
   "homepage": "https://github.com/agenticedgex/opendone#readme",
   "engines": {
