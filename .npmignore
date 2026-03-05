@@ -1,0 +1,7 @@
+# Personal test artifacts
+email_contract.json
+email_output.json
+receipt_*.json
+
+# Keys
+*.pem
