@@ -35,7 +35,7 @@ test('creates a valid contract', () => {
   });
   assert(c.contractId.startsWith('od_c_'), 'ID should start with od_c_');
   assert(c.hash, 'Should have hash');
-  assert(c.version === '0.3.0', 'Should have version');
+  assert(c.version === '0.4.0', 'Should have version');
 });
 
 test('throws on missing task', () => {
@@ -279,7 +279,7 @@ console.log('\nStorage');
 // ─────────────────────────────────────────────────────────────
 
 test('fileStore persists and queries receipts', () => {
-  const tmp = require("os").tmpdir() + `/od_test_${Date.now()}.json`;
+  const tmp = require("path").join(require("os").tmpdir(), `od_test_${Date.now()}.json`);
   const store = OpenDone.fileStore(tmp);
   
   const c = OpenDone.contract({ task: 'test', criteria: { required: ['x'] } });

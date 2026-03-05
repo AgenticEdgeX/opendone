@@ -1,4 +1,4 @@
-# OpenDone Specification v0.3.0
+# OpenDone Specification v0.4.0
 
 **A portable standard for machine-verifiable AI agent task completion.**
 
@@ -16,11 +16,12 @@ The result: agents self-report completion, humans manually review output, and th
 
 ## What OpenDone Does
 
-OpenDone defines three primitives:
+OpenDone defines four primitives:
 
 1. **Contract** — a machine-readable definition of what "done" means, written before the agent starts
 2. **Receipt** — a tamper-evident, signed record of what happened and whether criteria were met
 3. **Verify** — deterministic evaluation: same contract + same output = same verdict, every time
+4. **Coram** — a contract-anchored, append-only, hash-chained witness record of every agent action during a task, written by infrastructure outside the executing agent
 
 OpenDone does **not** define how agents execute tasks, which LLM to use, how agents communicate, or how to rate agent quality. It defines only the completion layer.
 
@@ -52,7 +53,7 @@ A contract is a JSON document that specifies:
 ```json
 {
   "contractId": "od_c_1748294000000_a1b2c3d4e5f6",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "task": "Process all pending invoices and return confirmation",
   "agent": "invoice-processor-v2",
   "criteria": {
@@ -87,7 +88,7 @@ Two types exist:
 ```json
 {
   "receiptId": "od_r_1748294000000_f6e5d4c3b2a1",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "isCheckpoint": false,
   "checkpointIteration": null,
   "contractId": "od_c_1748294000000_a1b2c3d4e5f6",
@@ -221,6 +222,10 @@ Format: `{prefix}_{unix_ms}_{6_random_bytes_hex}`
 | `SIGNATURE_INVALID` | Signature does not verify against provided key      |
 | `EVALUATION_ERROR`  | Unexpected failure during criteria evaluation — catch and log, do not retry blindly |
 | `STORE_ERROR`       | Storage adapter failed to persist receipt           |
+| `CORAM_TAMPER_DETECTED` | Coram hash chain integrity check failed         |
+| `CORAM_TRACE_MISMATCH`  | Receipt output does not reconcile with Coram inline payloads |
+| `CORAM_INVALID`         | Malformed or missing required Coram fields      |
+| `TOOL_POLICY_VIOLATION` | Agent attempted a blocked or out-of-scope tool call (Gate primitive) |
 
 ---
 
@@ -237,6 +242,17 @@ The following are out of scope for this specification and are intentionally left
 ---
 
 ## Changelog
+
+### v0.4.0
+- Added **Coram** — the fourth primitive: contract-anchored, append-only, hash-chained witness record of agent actions
+- Coram is infrastructure-written and agent-blind — the executing agent never reads or writes to it
+- Contract anchor: `entry[1].previousHash = SHA-256(contract)` — binds witness record cryptographically to the governing contract
+- Three payload modes: `hashed` (default), `inline` (full payloads), `redacted` (sensitive actions)
+- Loop detection: passive `loopWarning` flag per entry, `loopCount` increments — does not throw, Coram observes
+- Receipt integration: `coramId`, `coramHash`, `coramEntryCount` attached before receipt hashing — Coram is part of the tamper-evident record
+- Full Coram verification: `verifyCoram(coram, receipt)` checks chain integrity, anchor, count, finalHash
+- Four new error codes: `CORAM_TAMPER_DETECTED`, `CORAM_TRACE_MISMATCH`, `CORAM_INVALID`, `TOOL_POLICY_VIOLATION`
+- `coram` parameter added to `evaluate()` — optional, zero breaking changes for existing callers
 
 ### v0.3.0
 - Added `constraints` block to contracts (maxIterations, maxDurationMs, maxCostUsd, checkpointEvery)

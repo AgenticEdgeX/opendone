@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 
 /**
- * OpenDone v0.3.0
+ * OpenDone v0.4.0
  * A portable, machine-verifiable standard for AI agent task completion.
  * 
  * Core concepts:
  *   Contract  — defines what "done" means before the agent starts
  *   Receipt   — signed, tamper-evident proof of what happened
  *   Verify    — deterministic evaluation, same input = same verdict
+ *   Coram     — contract-anchored, append-only, hash-chained witness record
  * 
  * MIT License. https://github.com/agenticedge/opendone
  */
@@ -16,6 +17,7 @@
 
 const crypto = require('crypto');
 const fs = require('fs');
+const Coram = require('./coram');
 
 // ─────────────────────────────────────────────────────────────
 // ERRORS
@@ -53,7 +55,7 @@ const Errors = {
  * @param {object} [options.constraints] - Runtime boundaries (iterations, cost, time, checkpoints)
  * @param {string} [options.agent]       - Expected agent identifier
  * @param {number} [options.expiresIn]   - Seconds until contract expires
- * @param {string} [options.version]     - Schema version (default: '0.3.0')
+ * @param {string} [options.version]     - Schema version (default: '0.4.0')
  * 
  * @returns {object} contract
  * 
@@ -77,7 +79,7 @@ const Errors = {
  * });
  */
 function contract(options = {}) {
-  const { task, criteria, constraints, agent, expiresIn, version = '0.3.0' } = options;
+  const { task, criteria, constraints, agent, expiresIn, version = '0.4.0' } = options;
 
   if (!task || typeof task !== 'string') {
     throw new OpenDoneError(Errors.INVALID_CONTRACT, 'Contract requires a task description string');
@@ -168,7 +170,7 @@ function normalizeConstraints(constraints) {
  * @returns {object} receipt
  */
 function evaluate(options = {}) {
-  const { contract: c, output, agent, runtime = {}, store = defaultStore, privateKey } = options;
+  const { contract: c, output, agent, runtime = {}, store = defaultStore, privateKey, coram } = options;
 
   if (!c || !c.contractId) {
     throw new OpenDoneError(Errors.INVALID_CONTRACT, 'evaluate() requires a valid contract');
@@ -187,7 +189,13 @@ function evaluate(options = {}) {
 
   const passed = criteriaResults.every(r => r.passed) && constraintResults.every(r => r.passed);
 
-  const receipt = buildReceipt({
+  // If a Coram record was provided, close it and attach its fields before hashing
+  let closedCoram = null;
+  if (coram) {
+    closedCoram = Coram.closeCoram(coram);
+  }
+
+  const receiptFields = {
     contractId: c.contractId,
     contractHash: c.hash,
     task: c.task,
@@ -198,7 +206,13 @@ function evaluate(options = {}) {
     constraintResults,
     runtime,
     isCheckpoint: false,
-  });
+  };
+
+  if (closedCoram) {
+    Coram.attachCoramToReceipt(receiptFields, closedCoram);
+  }
+
+  const receipt = buildReceipt(receiptFields);
 
   if (privateKey) {
     receipt.signature = sign(receipt.hash, privateKey);
@@ -462,7 +476,7 @@ function buildReceipt(fields) {
 
   const payload = {
     receiptId,
-    version: '0.3.0',
+    version: '0.4.0',
     isCheckpoint: fields.isCheckpoint,
     checkpointIteration: fields.checkpointIteration || null,
     contractId: fields.contractId,
@@ -615,7 +629,7 @@ function runCLI() {
 
   if (!cmd || cmd === 'help') {
     console.log(`
-OpenDone v0.3.0 — machine-verifiable AI agent task completion
+OpenDone v0.4.0 — machine-verifiable AI agent task completion
 
 COMMANDS:
   evaluate  <contract.json> <output.json>   Evaluate output against contract
@@ -710,4 +724,13 @@ module.exports = {
   defaultStore,
   OpenDoneError,
   Errors,
+  // Coram — the fourth primitive
+  openCoram:            Coram.openCoram,
+  appendEntry:          Coram.appendEntry,
+  closeCoram:           Coram.closeCoram,
+  verifyCoram:          Coram.verifyCoram,
+  attachCoramToReceipt: Coram.attachCoramToReceipt,
+  coramFileStore:       Coram.coramFileStore,
+  defaultCoramStore:    Coram.defaultCoramStore,
+  CoramErrors:          Coram.CoramErrors,
 };

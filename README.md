@@ -28,6 +28,7 @@ npx opendone help
 - **Receipt** — signed, tamper-evident proof of what happened and whether criteria were met
 - **Checkpoint** — mid-execution receipts that verify constraints haven't been breached
 - **Verify** — deterministic: same contract + same output = same verdict, every time
+- **Coram** — contract-anchored, append-only, hash-chained witness record of every agent action, written by infrastructure outside the agent
 
 ---
 
@@ -146,6 +147,44 @@ const failedOnly   = store.query({ passed: false });
 
 ---
 
+## Coram
+
+Coram is the fourth primitive — a tamper-evident witness record of everything the agent did, cryptographically bound to the contract that governed the run.
+
+```javascript
+const OpenDone = require('opendone');
+
+const contract = OpenDone.contract({
+  task: 'Fetch and summarise 10 articles',
+  criteria: { required: ['summaries', 'count'] }
+});
+
+// Open a Coram record before the agent starts
+const coram = OpenDone.openCoram({ contract, agentId: 'my-agent-v1' });
+
+// Your agent loop — append an entry after each tool call
+for (const article of articles) {
+  const result = await agent.fetch(article.url);
+  OpenDone.appendEntry(coram, {
+    action: 'web.fetch',
+    input: { url: article.url },
+    result: { status: result.status, length: result.body.length }
+  });
+}
+
+// Pass coram into evaluate() — it closes and binds to the receipt automatically
+const receipt = OpenDone.evaluate({ contract, output: agentOutput, coram });
+
+// Verify the full chain: receipt integrity + Coram witness record
+const result = OpenDone.verifyCoram(coram, receipt);
+console.log(result.valid);         // true
+console.log(result.loopWarnings);  // any repeated actions flagged here
+```
+
+Coram is optional — existing `evaluate()` calls work unchanged. The agent never reads or writes Coram directly.
+
+---
+
 ## CLI
 
 ```bash
@@ -188,6 +227,7 @@ Nested fields via dot-notation: `"config.auth.token"`, `"meta.status"`
 | Observability (Arize, Braintrust) | Trace and evaluate agent quality |
 | Identity (AIP, SPIFFE) | Authenticate agents |
 | **OpenDone** | Define and verify task completion, portably, deterministically |
+| **OpenDone Coram** | Tamper-evident witness record bound to the governing contract — not just a log |
 
 OpenDone sits between execution and trust. It doesn't compete with any of these — it plugs into all of them.
 
