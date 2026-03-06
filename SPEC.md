@@ -27,8 +27,8 @@ const contract = od.contract({
   criteria: {
     required: ['summary'],
     conditions: [
-      { field: 'confidence', op: '>=', value: 0.8 },
-      { field: 'summary',    op: 'includes', value: 'revenue' }
+      { field: 'confidence', operator: '>=', value: 0.8 },
+      { field: 'summary',    operator: 'includes', value: 'revenue' }
     ]
   },
   constraints: {
@@ -39,8 +39,9 @@ const contract = od.contract({
 })
 ```
 
-**Fields:**
-- `contractId` — unique identifier
+**Fields on the returned contract object:**
+- `contractId` — unique identifier (`od_c_...`)
+- `version` — `'0.4.0'`
 - `task` — human-readable task description
 - `criteria.required` — output fields that must be present and non-empty
 - `criteria.conditions` — deterministic conditions on output fields
@@ -48,13 +49,14 @@ const contract = od.contract({
 - `expiresIn` / `expiresAt` — contract validity window
 - `hash` — SHA-256 of the contract contents
 - `signature` — optional RSA signature (via `od.sign()`)
-- `specVersion` — `"0.5.0"`
 
-**Supported operators:** `===`, `!==`, `>`, `>=`, `<`, `<=`, `includes`, `matches`, `exists`, `typeof`
+**Supported operators:** `===`, `!==`, `>`, `>=`, `<`, `<=`, `includes`, `startsWith`, `endsWith`, `matches`, `typeof`, `in`
+
+**Note:** Use `operator` not `op` — `op` throws `INVALID_CONTRACT`.
 
 All operators are deterministic. No LLM evaluation. Same input always produces the same verdict.
 
-**Security:** Contract objects are deeply frozen at creation. Fields cannot be mutated post-signing.
+**Security:** Contract `criteria` and `constraints` are deeply frozen at creation. Fields cannot be mutated post-creation.
 
 ---
 
@@ -66,33 +68,37 @@ Runs the agent's output against the contract. Produces a Receipt.
 const receipt = od.evaluate({
   contract,
   output: {
-    summary: 'Q1 revenue up 12% YoY...',
+    summary:    'Q1 revenue up 12% YoY...',
     confidence: 0.94
   },
-  agent: 'summarizer-v2',
-  runtime: {
-    durationMs: 4200,
-    iterations: 3
-  }
+  agent:   'summarizer-v2',
+  runtime: { durationMs: 4200, iterations: 3 },
+  coram,       // optional — attaches coram fields to receipt
+  privateKey,  // optional — signs the receipt
+  store        // optional — persists receipt (use od.fileStore(path))
 })
 ```
 
 **Receipt fields:**
-- `receiptId` — unique identifier
+- `receiptId` — unique identifier (`od_r_...`)
+- `version` — `'0.4.0'`
 - `contractId` / `contractHash` — binding to the governing contract
-- `status` — `passed` | `partial` | `failed` | `expired`
-- `score` — 0–1, ratio of criteria passed
-- `verifiedCriteria` — list of passing criteria
-- `violations` — list of failing criteria with reasons
-- `hash` — SHA-256 of the receipt contents
-- `signature` — optional RSA signature
+- `task` / `agent` / `issuedAt`
+- `passed` — boolean (`true` or `false`) — not a status string
+- `criteriaResults` — `[{ type, field, operator, passed, reason }]`
+- `constraintResults` — `[{ type, constraint, passed, limit, actual, reason }]`
+- `runtime` / `output`
+- `coramHash` / `coramEntryCount` / `coramStatus` — present when coram passed
+- `signature` — present when privateKey passed
+- `hash` — SHA-256 of the receipt
 
 **Notes:**
-- If `runtime` is omitted and the contract defines `maxDurationMs` or `maxIterations`, those are recorded as constraint violations.
+- `passed` is a boolean. There is no `status`, `score`, or `violations` field.
+- If `runtime` is omitted and the contract defines constraints, those are recorded as constraint violations and `passed` will be `false`.
 - `required` fields must be non-null and non-blank (whitespace-only fails).
-- Numeric operators (`>`, `>=`, `<`, `<=`) require the actual value to be `typeof === 'number'`.
-- Unknown operators fail closed (violation, not pass).
-- The `matches` operator validates regex patterns for safety before execution.
+- Numeric operators (`>`, `>=`, `<`, `<=`) require the actual value to be `typeof === 'number'`. String `'0.9'` does not pass `> 0.8`.
+- Unknown operators throw `INVALID_CONTRACT` at contract creation time.
+- The `matches` operator validates regex patterns for ReDoS safety before execution.
 
 ---
 
@@ -102,13 +108,14 @@ Deterministic verification of a receipt's integrity.
 
 ```js
 const result = od.verify(receipt)
-// { valid: true, status: 'passed', score: 0.94 }
+// { valid: true }
 
 // With signature verification
 const result = od.verify(receipt, publicKey)
+// { valid: true } or { valid: false, reason: '...' }
 ```
 
-Verify recomputes the receipt hash from its fields and compares it to the stored hash. Any field-level tampering — including status, score, violations, or contractHash — is detected.
+Verify recomputes the receipt hash from its fields and compares it to the stored hash. Any field-level tampering — including `passed`, `criteriaResults`, `constraintResults`, or `contractHash` — is detected.
 
 Signature verification is optional. An unsigned receipt can still be hash-verified. A signed receipt guarantees authorship in addition to integrity.
 
@@ -116,48 +123,76 @@ Signature verification is optional. An unsigned receipt can still be hash-verifi
 
 ### 4. Coram
 
-An append-only, hash-chained witness record of every agent action, bound to the governing contract. Written by infrastructure. The agent never sees it.
+An append-only, hash-chained witness record of every agent action, bound to the governing contract.
 
 ```js
-const coram = od.openCoram({ contract, agentId: 'agent-001' })
+const coram = od.openCoram({
+  contract,
+  agentId: 'agent-001',
+  mode: 'hashed'     // 'hashed' (default) | 'inline' | 'redacted'
+})
 
 od.appendEntry(coram, {
   action: 'tool.call',
   tool:   'web_search',
   input:  { query: 'Q1 earnings AAPL' },
-  result: { ... }
+  result: { hits: 3 }
 })
 
-// Verify the chain is intact
-od.verifyCoram(coram, receipt)
+od.closeCoram(coram)
+
+const result = od.verifyCoram(coram, receipt)
+// { valid: true, loopWarnings: [], detail: { entryCount: 1 } }
 ```
 
-Each entry includes:
-- `index` — position in the chain
-- `action`, `tool`, `input`, `result`, `source`, `timestamp`
-- `prevHash` — hash of the previous entry
-- `hash` — SHA-256 of this entry's fields
+**Coram record fields:**
+- `coramId` — unique identifier (`od_coram_...`)
+- `coramVersion` — `'0.1.0'`
+- `contractId` / `contractHash` — binding to governing contract
+- `agentId` / `mode` / `startedAt` / `closedAt`
+- `status` — `'open'` | `'closed'`
+- `entryCount` — number of entries
+- `entries` — array of entry objects
+- `finalHash` — hash of the last entry (or contractHash if empty)
 
-**Chain verification** recomputes the genesis hash from `coramId`, `contractId`, and `startedAt`, then walks every entry confirming hash integrity and chain links. Swapping `coramId` or reordering entries is detected.
+**Entry fields:**
+- `entryId` — sequential integer (1-based)
+- `timestamp` / `action` / `status`
+- `inputHash` / `resultHash` — SHA-256 of input/result (hashed mode)
+- `inputInline` / `resultInline` — raw values (inline mode)
+- `loopWarning` — boolean, true when this action+input has been seen before
+- `loopCount` — how many times this action+input has occurred (1-based)
+- `previousHash` — hash of the previous entry (first entry anchors to contractHash)
+- `entryHash` — SHA-256 of this entry's fields
 
-**Loop detection** is available via `coram.detectLoop(threshold)`.
+**Payload modes:**
+- `hashed` — input and result are SHA-256 hashed. Proves what was passed without exposing it.
+- `inline` — raw input and result stored. Full auditability, higher storage cost.
+- `redacted` — no payload stored. Action and timestamp only.
+
+**Loop detection** is automatic. `loopWarning` is set on any entry where the same `action` + `input` combination has appeared before. `loopCount` increments with each repeat.
+
+**Chain verification** walks every entry, recomputing each `entryHash` and confirming `previousHash` links. The first entry must anchor to `contractHash`. Any tampering — reordering, deletion, or field mutation — is detected.
 
 ---
 
 ### 5. Umbra
 
-The enforcement layer. Sits between the agent and its tools. Checks every tool call against policy before it executes. The agent never sees it.
+The enforcement layer. Sits between the agent and its tools. Checks every tool call against policy before it executes.
 
 ```js
-const umbra = od.openUmbra({
+const { openUmbra, UmbraViolationError, UmbraLoopError } = require('./umbra')
+
+const umbra = openUmbra({
   contract,
   coram,
-  preset: 'sensitive',        // explore | operate | sensitive | custom
+  preset: 'operate',        // explore | operate | sensitive
   overrides: {
     loopThreshold: 2,
-    onLoop: 'realign',        // realign | compress | pause | throw
-    onHumanApproval: async (violation) => { ... },
-    blocklist: ['exec_shell', 'send_email_external']
+    onLoop: 'realign',      // realign | compress | pause | throw
+    blocklist: ['exec_shell', 'send_email_external'],
+    allowlist: ['web_search', 'read_file', 'write_file'],
+    onHumanApproval: async (event) => true
   }
 })
 
@@ -166,6 +201,10 @@ await umbra.check({ tool: 'web_search', input: { query: '...' } })
 // throws UmbraViolationError on policy breach (enforce mode)
 // returns warning object (warn mode)
 // logs and passes (audit mode)
+
+const summary = umbra.close()
+// { closedAt, totalChecks, violations }
+// violations is an integer count of policy violations recorded during this session
 ```
 
 **Three modes:**
@@ -189,18 +228,16 @@ await umbra.check({ tool: 'web_search', input: { query: '...' } })
 2. Blocklist — tool must not be in the list
 3. Contract scope — if `contract.allowedTools` is defined, tool must be in scope
 
-**Loop enforcement:** Loop threshold always throws (or triggers corrective action) regardless of mode. A stuck agent is a factual determination, not a policy one.
+**Loop enforcement:** Loop threshold always triggers `onLoop` regardless of mode. A stuck agent is a factual determination, not a policy one.
 
 **Corrective action stack (`onLoop`):**
 
 | Action | Behavior |
 |---|---|
-| `realign` | Injects goal realignment directive from contract |
-| `compress` | Injects Coram digest — tools tried, constraints remaining |
+| `realign` | Returns goal realignment directive from contract |
+| `compress` | Returns Coram digest — tools tried, constraints remaining |
 | `pause` | Calls `onHumanApproval` — human in the loop |
 | `throw` | Throws `UmbraLoopError` — agent halted |
-
-**Coram integration:** Every passing tool call is automatically appended to Coram. Blocked calls are never logged.
 
 **Tool name normalization:** All tool names are normalized before comparison — lowercased, trimmed, zero-width characters stripped, NFC normalized. Prevents case variation and whitespace bypass attacks.
 
@@ -218,7 +255,8 @@ const signedContract = od.sign(contract, privateKey)
 const receipt = od.evaluate({ contract: signedContract, output, agent, privateKey })
 
 // Verify signature
-od.verify(receipt, publicKey)
+const result = od.verify(receipt, publicKey)
+// { valid: true } or { valid: false, reason: '...' }
 ```
 
 ---
@@ -232,33 +270,37 @@ Coram (open witness record)     Umbra (open enforcement layer)
     ↓                               ↓
     ←──────── agent tool calls ─────→
     ↓  (Umbra checks each call)     ↓
-    ↓  (passing calls → Coram)      ↓
-Evaluate (agent output vs contract)
+    ↓  (append entries to Coram)    ↓
+Evaluate (agent output vs contract, coram passed in)
     ↓
-Receipt (tamper-evident verdict)
+Receipt (tamper-evident verdict with coramHash bound)
     ↓
 Verify (anyone, anywhere, no dependencies)
+verifyCoram (chain integrity + receipt cross-check)
 ```
 
 ---
 
 ## Security model
 
-- Receipts are hash-verified. Any field-level tampering is detected.
-- Signed receipts additionally verify authorship.
-- The `_sha256` function is internal — not exported. Receipts cannot be forged by recomputing the hash externally.
-- Contract objects are deeply frozen at creation. Post-creation mutation is blocked.
-- Coram chains are verified end-to-end including genesis hash. CoramId swaps are detected.
-- Umbra tool names are normalized before comparison. String manipulation bypass attempts are blocked.
+- Receipts are SHA-256 hashed. Any field-level tampering is detected by `verify()`.
+- Signed receipts additionally verify authorship via RSA.
+- `canonicalHash` is internal — not exported. Receipts cannot be forged by recomputing the hash externally.
+- Contract `criteria` and `constraints` are deeply frozen at creation. Post-creation mutation throws in strict mode.
+- Coram chains are verified end-to-end. First entry anchors to `contractHash`. Reordering or deletion is detected.
+- `verifyCoram(coram, receipt)` cross-checks `coramHash`, `coramId`, and `coramEntryCount` — binding the witness log to the receipt.
+- Umbra tool names are normalized before comparison. Unicode and whitespace bypass attempts are blocked.
 - The `matches` operator rejects dangerous regex patterns to prevent ReDoS.
+- Numeric operators require `typeof === 'number'`. String coercion (`'0.9' > 0.8`) is blocked.
+- Missing `runtime` when constraints are defined is treated as a constraint violation — not a pass.
 
 ---
 
 ## What a valid receipt proves
 
-A passed receipt with a valid hash confirms:
-- The output was evaluated against the stated contract
-- The specific criteria listed in `verifiedCriteria` passed
+A receipt with `passed: true` and `verify().valid === true` confirms:
+- The output was evaluated against the stated contract at `issuedAt`
+- Every criterion in `criteriaResults` was checked and passed
 - The receipt has not been modified since evaluation
 
 A signed receipt additionally proves the receipt was produced by the holder of the corresponding private key.

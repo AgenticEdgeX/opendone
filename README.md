@@ -39,8 +39,7 @@ npm install opendone
 
 ```js
 const od = require('opendone')
-const { openCoram } = require('opendone/coram')
-const { openUmbra } = require('opendone/umbra')
+const { openUmbra } = require('./umbra')  // umbra.js ships with the package — require it directly
 
 // 1. Define the task
 const contract = od.contract({
@@ -48,8 +47,8 @@ const contract = od.contract({
   criteria: {
     required: ['summary'],
     conditions: [
-      { field: 'confidence', op: '>=', value: 0.8 },
-      { field: 'summary',    op: 'includes', value: 'revenue' }
+      { field: 'confidence', operator: '>=', value: 0.8 },
+      { field: 'summary',    operator: 'includes', value: 'revenue' }
     ]
   },
   constraints: {
@@ -59,7 +58,7 @@ const contract = od.contract({
 })
 
 // 2. Open witness record + enforcement layer
-const coram = openCoram({ contract, agentId: 'my-agent-v1' })
+const coram = od.openCoram({ contract, agentId: 'my-agent-v1' })
 const umbra = openUmbra({
   contract,
   coram,
@@ -74,7 +73,11 @@ await umbra.check({ tool: 'web_search', input: { query: 'Q1 earnings' } })
 await umbra.check({ tool: 'read_file',  input: { path: 'report.pdf' } })
 // Blocked calls throw UmbraViolationError and are never logged to Coram
 
-// 4. Evaluate agent output against the contract
+// 4. Log actions to Coram
+od.appendEntry(coram, { action: 'tool.call', tool: 'web_search', input: { query: 'Q1 earnings' } })
+od.appendEntry(coram, { action: 'tool.call', tool: 'read_file',  input: { path: 'report.pdf' } })
+
+// 5. Evaluate agent output against the contract
 const receipt = od.evaluate({
   contract,
   output: {
@@ -82,20 +85,20 @@ const receipt = od.evaluate({
     confidence: 0.94
   },
   agent:   'my-agent-v1',
-  runtime: { durationMs: 4200, iterations: 3 }
+  runtime: { durationMs: 4200, iterations: 3 },
+  coram                          // attaches coramHash, coramEntryCount, coramStatus to receipt
 })
 
-console.log(receipt.status) // 'passed'
-console.log(receipt.score)  // 1
+console.log(receipt.passed)      // true
+console.log(receipt.coramHash)   // sha256 of the sealed witness log
 
-// 5. Verify the receipt — anyone, anywhere, no dependencies
+// 6. Verify the receipt — anyone, anywhere, no dependencies
 const result = od.verify(receipt)
-console.log(result.valid) // true
+console.log(result.valid)        // true
 
-// 6. Verify the Coram chain is intact and bound to the receipt
-const { verifyCoram } = require('opendone/coram')
-const chainResult = verifyCoram(coram.getRecord(), receipt)
-console.log(chainResult.valid) // true
+// 7. Verify the Coram chain is intact and bound to the receipt
+const chainResult = od.verifyCoram(coram, receipt)
+console.log(chainResult.valid)   // true
 ```
 
 ---
@@ -103,6 +106,8 @@ console.log(chainResult.valid) // true
 ## Umbra modes
 
 ```js
+const { openUmbra, UmbraViolationError, UmbraLoopError } = require('./umbra')  // umbra.js ships with the package — require it directly
+
 const umbra = openUmbra({
   contract,
   coram,
@@ -112,17 +117,13 @@ const umbra = openUmbra({
     onLoop: 'realign',   // realign | compress | pause | throw
     blocklist: ['exec_shell', 'modify_policy'],
     allowlist: ['web_search', 'read_file', 'write_file'],
-    onHumanApproval: async (event) => {
-      // called on warn-mode violations or pause loop action
-      return true // approve
-    }
   }
 })
 
 await umbra.check({ tool: 'web_search', input: { query: '...' } })
-// passes → appended to Coram automatically
-// blocked → throws UmbraViolationError, never touches Coram
-// loop → triggers onLoop action
+// passes  → allowed
+// blocked → throws UmbraViolationError
+// loop    → triggers onLoop action (realign | compress | pause | throw)
 ```
 
 ---
@@ -144,8 +145,8 @@ const receipt = od.evaluate({
 })
 
 // Verify signature + hash integrity
-od.verify(receipt, publicKey)
-// { valid: true, status: 'passed', score: 1 }
+const result = od.verify(receipt, publicKey)
+console.log(result.valid)  // true
 ```
 
 ---
@@ -153,37 +154,25 @@ od.verify(receipt, publicKey)
 ## Coram
 
 ```js
-const { openCoram, verifyCoram } = require('opendone/coram')
+const coram = od.openCoram({ contract, agentId: 'agent-001', mode: 'hashed' })
+// mode: 'hashed' (default) | 'inline' | 'redacted'
 
-const coram = openCoram({ contract, agentId: 'agent-001' })
-
-// Entries are appended automatically by Umbra for every passing tool call
-// You can also append manually:
-coram.appendEntry({
+// Append entries manually (or automatically via Umbra for passing calls)
+od.appendEntry(coram, {
   action: 'tool.call',
   tool:   'web_search',
   input:  { query: '...' },
-  result: { ... }
+  result: { hits: 3 }
 })
 
-// Verify the full chain
-coram.verifyChain()
-// { valid: true, entries: 4 }
+// Each entry has: entryId, action, inputHash, resultHash,
+//                loopWarning, loopCount, previousHash, entryHash
 
-// Loop detection
-coram.detectLoop(3)
-// null, or { detected: true, tool: '...', repeatCount: 3 }
-
-// Compact digest
-coram.digest()
-// { entryCount, toolsUsed, finalHash, ... }
-
-// Seal (makes append-only permanent)
-coram.seal()
-
-// Bind to receipt
-verifyCoram(coram.getRecord(), receipt)
-// { valid: true, bound: true, entries: 4 }
+// Close and verify the chain
+od.closeCoram(coram)
+const verify = od.verifyCoram(coram)
+console.log(verify.valid)          // true
+console.log(verify.loopWarnings)   // [] or [{ action, loopCount, entryId }]
 ```
 
 ---
@@ -196,18 +185,46 @@ All evaluation is deterministic. No LLM calls. Same input always produces the sa
 |---|---|
 | `===` | Strict equality |
 | `!==` | Strict inequality |
-| `>` `>=` `<` `<=` | Numeric comparison (requires `typeof === 'number'`) |
+| `>` `>=` `<` `<=` | Numeric comparison (value must be `typeof === 'number'`) |
 | `includes` | String includes substring |
-| `matches` | Regex test (safe — dangerous patterns rejected) |
-| `exists` | Field is non-null and non-undefined |
+| `startsWith` | String starts with value |
+| `endsWith` | String ends with value |
+| `matches` | Regex test (dangerous patterns rejected — ReDoS safe) |
 | `typeof` | Type check |
+| `in` | Value is in array |
+
+---
+
+## Receipt shape
+
+```js
+{
+  receiptId,         // unique identifier
+  version,           // '0.4.0'
+  contractId,        // binding to the governing contract
+  contractHash,      // SHA-256 of the contract
+  task,              // from the contract
+  agent,             // agent identifier
+  issuedAt,          // ISO timestamp
+  passed,            // boolean — true or false (NOT a status string)
+  criteriaResults,   // [{ type, field, operator, passed, reason }]
+  constraintResults, // [{ type, constraint, passed, limit, actual, reason }]
+  runtime,           // { durationMs, iterations, costUsd }
+  output,            // sanitized agent output
+  coramHash,         // present when coram passed to evaluate()
+  coramEntryCount,   // present when coram passed to evaluate()
+  coramStatus,       // present when coram passed to evaluate()
+  signature,         // present when privateKey passed to evaluate()
+  hash               // SHA-256 of the receipt
+}
+```
 
 ---
 
 ## CLI
 
 ```bash
-npx opendone evaluate contract.json output.json --sign
+npx opendone evaluate contract.json output.json
 npx opendone verify receipt.json
 npx opendone keygen
 npx opendone inspect receipt.json
@@ -218,7 +235,7 @@ npx opendone inspect receipt.json
 ## What a valid receipt proves
 
 - The output was evaluated against the stated contract
-- The criteria listed in `verifiedCriteria` passed at evaluation time
+- The criteria in `criteriaResults` were checked at evaluation time
 - The receipt has not been modified since it was produced
 
 A signed receipt additionally proves authorship — it was produced by the holder of the corresponding private key.
@@ -231,9 +248,9 @@ A signed receipt additionally proves authorship — it was produced by the holde
 
 ```bash
 npm test
-# node test.js        → 20/20
-# node test-coram.js  → 41/41
-# node test-integration.js → 65/65
+# node test.js             → 20/20
+# node test-coram.js       → 41/41
+# node test-integration.js → 71/71
 ```
 
 ---

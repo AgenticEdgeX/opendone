@@ -1,7 +1,23 @@
-# Personal test artifacts
-email_contract.json
-email_output.json
-receipt_*.json
+# Test files
+test.js
+test-coram.js
+test-integration.js
 
-# Keys
-*.pem
+# Session / dev files
+handoff.md
+*.handoff.*
+OpenDone_Handoff*.docx
+
+# Node cache
+node-compile-cache/
+
+# Binaries / tools
+phantomjs/
+*.tar.bz2
+
+# Lock files
+uv-*.lock
+
+# OS
+.DS_Store
+Thumbs.db

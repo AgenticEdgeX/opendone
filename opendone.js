@@ -600,7 +600,4 @@ module.exports = {
   closeCoram:           Coram.closeCoram,
   verifyCoram:          Coram.verifyCoram,
   attachCoramToReceipt: Coram.attachCoramToReceipt,
-  coramFileStore:       Coram.coramFileStore,
-  defaultCoramStore:    Coram.defaultCoramStore,
-  CoramErrors:          Coram.CoramErrors,
 };
