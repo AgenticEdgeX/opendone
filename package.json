@@ -1,6 +1,6 @@
 {
   "name": "opendone",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Open standard for machine-verifiable AI agent task completion",
   "main": "opendone.js",
   "scripts": {
