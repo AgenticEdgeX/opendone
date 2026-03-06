@@ -1,38 +1,33 @@
 {
   "name": "opendone",
-  "version": "0.4.0",
-  "description": "A portable standard for machine-verifiable AI agent task completion",
+  "version": "0.5.0",
+  "description": "Open standard for machine-verifiable AI agent task completion",
   "main": "opendone.js",
-  "bin": {
-    "opendone": "opendone.js"
-  },
   "scripts": {
-    "test": "node test.js && node test-coram.js",
-    "test:core": "node test.js",
-    "test:coram": "node test-coram.js"
+    "test": "node test.js && node test-coram.js && node test-integration.js"
   },
+  "files": [
+    "opendone.js",
+    "coram.js",
+    "umbra.js",
+    "SPEC.md",
+    "README.md",
+    "LICENSE",
+    "examples/"
+  ],
   "keywords": [
-    "ai-agents",
+    "ai",
+    "agents",
     "verification",
-    "task-completion",
-    "guardrails",
     "audit",
-    "mcp",
-    "open-standard",
-    "trust",
-    "coram",
-    "witness-record",
     "receipt",
-    "contract"
+    "contract",
+    "coram",
+    "umbra",
+    "deterministic",
+    "agentic"
   ],
   "author": "AgenticEdgeX",
   "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/agenticedgex/opendone.git"
-  },
-  "homepage": "https://github.com/agenticedgex/opendone#readme",
-  "engines": {
-    "node": ">=16.0.0"
-  }
+  "dependencies": {}
 }

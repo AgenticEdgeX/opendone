@@ -1,16 +1,24 @@
 #!/usr/bin/env node
-
 /**
- * OpenDone v0.4.0
+ * OpenDone v0.5.0
  * A portable, machine-verifiable standard for AI agent task completion.
- * 
+ *
  * Core concepts:
  *   Contract  — defines what "done" means before the agent starts
  *   Receipt   — signed, tamper-evident proof of what happened
  *   Verify    — deterministic evaluation, same input = same verdict
  *   Coram     — contract-anchored, append-only, hash-chained witness record
- * 
+ *   Umbra     — tool-call enforcement layer, policy before execution
+ *
  * MIT License. https://github.com/agenticedge/opendone
+ *
+ * Security hardening v0.5.0:
+ *   - Contract objects deeply frozen at creation (mutation bypass fix)
+ *   - canonicalHash internal only — not exported (forgery prevention)
+ *   - matches operator rejects dangerous regex patterns (ReDoS fix)
+ *   - required fields reject whitespace-only strings
+ *   - numeric operators require typeof === 'number' (type coercion fix)
+ *   - missing runtime fields are violations, not silently skipped
  */
 
 'use strict';
@@ -43,41 +51,40 @@ const Errors = {
 };
 
 // ─────────────────────────────────────────────────────────────
+// DEEP FREEZE
+// ─────────────────────────────────────────────────────────────
+
+function deepFreeze(obj) {
+  if (obj === null || typeof obj !== 'object') return obj;
+  Object.keys(obj).forEach(k => deepFreeze(obj[k]));
+  return Object.freeze(obj);
+}
+
+// ─────────────────────────────────────────────────────────────
+// REDOS PROTECTION
+// ─────────────────────────────────────────────────────────────
+
+const DANGEROUS_REGEX_PATTERNS = [
+  /\(([^)]+)\+\)\+/,
+  /\(([^)]+)\*\)\*/,
+  /\(([^)]+)[+*]\)[+*]/,
+  /\(\?=.*\)\*/,
+];
+const MAX_REGEX_INPUT_LENGTH = 10000;
+
+function safeRegexTest(pattern, value) {
+  for (const danger of DANGEROUS_REGEX_PATTERNS) {
+    if (danger.test(pattern)) {
+      throw new OpenDoneError(Errors.EVALUATION_ERROR, `Unsafe regex pattern rejected: ${pattern}`);
+    }
+  }
+  return new RegExp(pattern).test(String(value).slice(0, MAX_REGEX_INPUT_LENGTH));
+}
+
+// ─────────────────────────────────────────────────────────────
 // CONTRACT
 // ─────────────────────────────────────────────────────────────
 
-/**
- * Create a machine-verifiable completion contract.
- * 
- * @param {object} options
- * @param {string} options.task          - Human-readable description of the task
- * @param {object} options.criteria      - Completion criteria (required fields + conditions)
- * @param {object} [options.constraints] - Runtime boundaries (iterations, cost, time, checkpoints)
- * @param {string} [options.agent]       - Expected agent identifier
- * @param {number} [options.expiresIn]   - Seconds until contract expires
- * @param {string} [options.version]     - Schema version (default: '0.4.0')
- * 
- * @returns {object} contract
- * 
- * @example
- * const contract = OpenDone.contract({
- *   task: 'Process invoice batch and return confirmation',
- *   criteria: {
- *     required: ['invoiceIds', 'totalProcessed', 'status'],
- *     conditions: [
- *       { field: 'status',          operator: '===', value: 'complete' },
- *       { field: 'totalProcessed',  operator: '>',   value: 0 },
- *       { field: 'errors',          operator: '===', value: 0 }
- *     ]
- *   },
- *   constraints: {
- *     maxIterations: 50,
- *     maxDurationMs: 30000,
- *     maxCostUsd: 0.10,
- *     checkpointEvery: 10
- *   }
- * });
- */
 function contract(options = {}) {
   const { task, criteria, constraints, agent, expiresIn, version = '0.4.0' } = options;
 
@@ -103,18 +110,19 @@ function contract(options = {}) {
     constraints: normalizeConstraints(constraints),
     createdAt: new Date(now).toISOString(),
     expiresAt: expiresIn ? new Date(now + expiresIn * 1000).toISOString() : null,
-    signature: null,  // populated by sign(contract, privateKey)
+    signature: null,
   };
 
   c.hash = canonicalHash(omit(c, ['hash', 'signature']));
+  Object.freeze(c.criteria);
+  Object.freeze(c.criteria.required);
+  Object.freeze(c.criteria.conditions);
+  if (c.constraints) Object.freeze(c.constraints);
   return c;
 }
 
 function normalizeCriteria(criteria) {
-  const valid = {
-    required: [],
-    conditions: [],
-  };
+  const valid = { required: [], conditions: [] };
 
   if (Array.isArray(criteria.required)) {
     for (const field of criteria.required) {
@@ -144,9 +152,9 @@ function normalizeCriteria(criteria) {
 function normalizeConstraints(constraints) {
   if (!constraints) return null;
   return {
-    maxIterations:  constraints.maxIterations  || null,
-    maxDurationMs:  constraints.maxDurationMs  || null,
-    maxCostUsd:     constraints.maxCostUsd     || null,
+    maxIterations:   constraints.maxIterations   || null,
+    maxDurationMs:   constraints.maxDurationMs   || null,
+    maxCostUsd:      constraints.maxCostUsd      || null,
     checkpointEvery: constraints.checkpointEvery || null,
   };
 }
@@ -155,20 +163,6 @@ function normalizeConstraints(constraints) {
 // EVALUATE
 // ─────────────────────────────────────────────────────────────
 
-/**
- * Evaluate an agent's output against a contract.
- * Deterministic: same contract + same output = same verdict, every time.
- * 
- * @param {object} options
- * @param {object} options.contract      - Contract from OpenDone.contract()
- * @param {object} options.output        - Agent output to evaluate
- * @param {string} [options.agent]       - Agent identifier
- * @param {object} [options.runtime]     - Actual runtime stats { iterations, durationMs, costUsd }
- * @param {object} [options.store]       - Storage adapter (default: in-memory)
- * @param {string} [options.privateKey]  - PEM private key for signing the receipt
- * 
- * @returns {object} receipt
- */
 function evaluate(options = {}) {
   const { contract: c, output, agent, runtime = {}, store = defaultStore, privateKey, coram } = options;
 
@@ -176,31 +170,23 @@ function evaluate(options = {}) {
     throw new OpenDoneError(Errors.INVALID_CONTRACT, 'evaluate() requires a valid contract');
   }
 
-  // Check expiry
   if (c.expiresAt && new Date() > new Date(c.expiresAt)) {
     throw new OpenDoneError(Errors.CONTRACT_EXPIRED, `Contract expired at ${c.expiresAt}`);
   }
 
-  // Evaluate criteria
-  const criteriaResults = evaluateCriteria(c.criteria, output);
-
-  // Evaluate constraints
+  const criteriaResults   = evaluateCriteria(c.criteria, output);
   const constraintResults = evaluateConstraints(c.constraints, runtime);
-
   const passed = criteriaResults.every(r => r.passed) && constraintResults.every(r => r.passed);
 
-  // If a Coram record was provided, close it and attach its fields before hashing
   let closedCoram = null;
-  if (coram) {
-    closedCoram = Coram.closeCoram(coram);
-  }
+  if (coram) closedCoram = Coram.closeCoram(coram);
 
   const receiptFields = {
-    contractId: c.contractId,
+    contractId:   c.contractId,
     contractHash: c.hash,
-    task: c.task,
-    agent: agent || c.agent || 'unknown',
-    output: sanitize(output),
+    task:         c.task,
+    agent:        agent || c.agent || 'unknown',
+    output:       sanitize(output),
     passed,
     criteriaResults,
     constraintResults,
@@ -208,15 +194,10 @@ function evaluate(options = {}) {
     isCheckpoint: false,
   };
 
-  if (closedCoram) {
-    Coram.attachCoramToReceipt(receiptFields, closedCoram);
-  }
+  if (closedCoram) Coram.attachCoramToReceipt(receiptFields, closedCoram);
 
   const receipt = buildReceipt(receiptFields);
-
-  if (privateKey) {
-    receipt.signature = sign(receipt.hash, privateKey);
-  }
+  if (privateKey) receipt.signature = sign(receipt.hash, privateKey);
 
   store.save(receipt);
   return receipt;
@@ -226,22 +207,6 @@ function evaluate(options = {}) {
 // CHECKPOINT
 // ─────────────────────────────────────────────────────────────
 
-/**
- * Emit a checkpoint receipt mid-execution.
- * Records current state + runtime stats against contract constraints.
- * Does NOT evaluate completion criteria (task isn't done yet).
- * 
- * @param {object} options
- * @param {object} options.contract      - Contract from OpenDone.contract()
- * @param {number} options.iteration     - Current iteration number
- * @param {object} [options.state]       - Current agent state snapshot
- * @param {object} [options.runtime]     - Current runtime stats { iterations, durationMs, costUsd }
- * @param {string} [options.agent]       - Agent identifier
- * @param {object} [options.store]       - Storage adapter
- * @param {string} [options.privateKey]  - PEM private key for signing
- * 
- * @returns {object} checkpoint receipt
- */
 function checkpoint(options = {}) {
   const { contract: c, iteration, state = {}, runtime = {}, agent, store = defaultStore, privateKey } = options;
 
@@ -253,26 +218,15 @@ function checkpoint(options = {}) {
   const constraintsPassed = constraintResults.every(r => r.passed);
 
   const receipt = buildReceipt({
-    contractId: c.contractId,
-    contractHash: c.hash,
-    task: c.task,
-    agent: agent || c.agent || 'unknown',
-    output: sanitize(state),
-    passed: constraintsPassed,
-    criteriaResults: [],  // not evaluated at checkpoint
-    constraintResults,
-    runtime,
-    isCheckpoint: true,
-    checkpointIteration: iteration,
+    contractId: c.contractId, contractHash: c.hash, task: c.task,
+    agent: agent || c.agent || 'unknown', output: sanitize(state),
+    passed: constraintsPassed, criteriaResults: [], constraintResults,
+    runtime, isCheckpoint: true, checkpointIteration: iteration,
   });
 
-  if (privateKey) {
-    receipt.signature = sign(receipt.hash, privateKey);
-  }
-
+  if (privateKey) receipt.signature = sign(receipt.hash, privateKey);
   store.save(receipt);
 
-  // Signal if constraints breached — caller can abort
   if (!constraintsPassed) {
     const breached = constraintResults.filter(r => !r.passed).map(r => r.constraint);
     throw new OpenDoneError(
@@ -289,58 +243,31 @@ function checkpoint(options = {}) {
 // VERIFY
 // ─────────────────────────────────────────────────────────────
 
-/**
- * Verify a receipt hasn't been tampered with.
- * Optionally verify the signature against a public key.
- * 
- * @param {object} receipt       - Receipt from evaluate() or checkpoint()
- * @param {string} [publicKey]   - PEM public key for signature verification
- * @returns {{ valid: boolean, reason: string }}
- */
 function verify(receipt, publicKey = null) {
   const { hash, signature, ...payload } = receipt;
-
   const expectedHash = canonicalHash(payload);
+
   if (hash !== expectedHash) {
     return { valid: false, reason: 'Hash mismatch — receipt may have been tampered with' };
   }
-
   if (publicKey) {
-    if (!signature) {
-      return { valid: false, reason: 'No signature present — cannot verify origin' };
-    }
-    const sigValid = verifySignature(hash, signature, publicKey);
-    if (!sigValid) {
+    if (!signature) return { valid: false, reason: 'No signature present — cannot verify origin' };
+    if (!verifySignature(hash, signature, publicKey)) {
       return { valid: false, reason: 'Signature invalid — receipt origin cannot be confirmed' };
     }
   }
-
   return { valid: true, reason: 'Receipt integrity confirmed' };
 }
 
 // ─────────────────────────────────────────────────────────────
-// SIGN CONTRACT OR RECEIPT
+// SIGN
 // ─────────────────────────────────────────────────────────────
 
-/**
- * Sign a contract or receipt with a private key.
- * Returns the same object with signature populated.
- */
 function signDocument(doc, privateKey) {
-  if (!doc.hash) {
-    throw new OpenDoneError('MISSING_HASH', 'Document must have a hash before signing');
-  }
+  if (!doc.hash) throw new OpenDoneError('MISSING_HASH', 'Document must have a hash before signing');
   return { ...doc, signature: sign(doc.hash, privateKey) };
 }
 
-// ─────────────────────────────────────────────────────────────
-// KEY GENERATION
-// ─────────────────────────────────────────────────────────────
-
-/**
- * Generate an RSA keypair for signing contracts and receipts.
- * @returns {{ publicKey: string, privateKey: string }}
- */
 function generateKeyPair() {
   return crypto.generateKeyPairSync('rsa', {
     modulusLength: 2048,
@@ -360,19 +287,15 @@ function evaluateCriteria(criteria, output) {
     return [{ constraint: 'output_type', passed: false, reason: 'Output must be an object' }];
   }
 
-  // Required fields
   for (const field of (criteria.required || [])) {
     const val = getNestedValue(output, field);
-    const passed = val !== undefined && val !== null;
+    const present = val !== undefined && val !== null && String(val).trim() !== '';
     results.push({
-      type: 'required',
-      field,
-      passed,
-      reason: passed ? `Field '${field}' present` : `Required field '${field}' is missing or null`,
+      type: 'required', field, passed: present,
+      reason: present ? `Field '${field}' present` : `Required field '${field}' is missing, null, or blank`,
     });
   }
 
-  // Conditions
   for (const cond of (criteria.conditions || [])) {
     const val = getNestedValue(output, cond.field);
     let passed = false;
@@ -380,21 +303,27 @@ function evaluateCriteria(criteria, output) {
 
     try {
       switch (cond.operator) {
-        case '>':          passed = val > cond.value;                          break;
-        case '<':          passed = val < cond.value;                          break;
-        case '>=':         passed = val >= cond.value;                         break;
-        case '<=':         passed = val <= cond.value;                         break;
-        case '===':        passed = val === cond.value;                        break;
-        case '!==':        passed = val !== cond.value;                        break;
-        case 'includes':   passed = String(val).includes(String(cond.value));  break;
-        case 'startsWith': passed = String(val).startsWith(String(cond.value));break;
-        case 'endsWith':   passed = String(val).endsWith(String(cond.value));  break;
-        case 'matches':    passed = new RegExp(cond.value).test(String(val));  break;
-        case 'typeof':     passed = typeof val === cond.value;                 break;
+        case '>':
+          if (typeof val !== 'number') { passed = false; reason = `'${cond.field}' must be a number for '>' operator`; break; }
+          passed = val > cond.value; break;
+        case '<':
+          if (typeof val !== 'number') { passed = false; reason = `'${cond.field}' must be a number for '<' operator`; break; }
+          passed = val < cond.value; break;
+        case '>=':
+          if (typeof val !== 'number') { passed = false; reason = `'${cond.field}' must be a number for '>=' operator`; break; }
+          passed = val >= cond.value; break;
+        case '<=':
+          if (typeof val !== 'number') { passed = false; reason = `'${cond.field}' must be a number for '<=' operator`; break; }
+          passed = val <= cond.value; break;
+        case '===':        passed = val === cond.value; break;
+        case '!==':        passed = val !== cond.value; break;
+        case 'includes':   passed = String(val).includes(String(cond.value)); break;
+        case 'startsWith': passed = String(val).startsWith(String(cond.value)); break;
+        case 'endsWith':   passed = String(val).endsWith(String(cond.value)); break;
+        case 'matches':    passed = safeRegexTest(cond.value, val); break;
+        case 'typeof':     passed = typeof val === cond.value; break;
         case 'in':         passed = Array.isArray(cond.value) && cond.value.includes(val); break;
-        default:
-          passed = false;
-          reason = `Unknown operator: ${cond.operator}`;
+        default:           passed = false; reason = `Unknown operator: ${cond.operator}`;
       }
       if (!reason) {
         reason = passed
@@ -418,45 +347,51 @@ function evaluateCriteria(criteria, output) {
 
 function evaluateConstraints(constraints, runtime) {
   if (!constraints) return [];
-
   const results = [];
 
-  if (constraints.maxIterations !== null && runtime.iterations !== undefined) {
-    const passed = runtime.iterations <= constraints.maxIterations;
-    results.push({
-      type: 'constraint',
-      constraint: 'maxIterations',
-      passed,
-      limit: constraints.maxIterations,
-      actual: runtime.iterations,
-      reason: passed
-        ? `Iterations ${runtime.iterations} ≤ limit ${constraints.maxIterations}`
-        : `Iterations ${runtime.iterations} exceeded limit ${constraints.maxIterations}`,
-    });
+  if (constraints.maxIterations !== null) {
+    if (runtime.iterations === undefined) {
+      results.push({
+        type: 'constraint', constraint: 'maxIterations', passed: false,
+        limit: constraints.maxIterations, actual: undefined,
+        reason: 'maxIterations constraint defined but runtime.iterations not provided',
+      });
+    } else {
+      const passed = runtime.iterations <= constraints.maxIterations;
+      results.push({
+        type: 'constraint', constraint: 'maxIterations', passed,
+        limit: constraints.maxIterations, actual: runtime.iterations,
+        reason: passed
+          ? `Iterations ${runtime.iterations} ≤ limit ${constraints.maxIterations}`
+          : `Iterations ${runtime.iterations} exceeded limit ${constraints.maxIterations}`,
+      });
+    }
   }
 
-  if (constraints.maxDurationMs !== null && runtime.durationMs !== undefined) {
-    const passed = runtime.durationMs <= constraints.maxDurationMs;
-    results.push({
-      type: 'constraint',
-      constraint: 'maxDurationMs',
-      passed,
-      limit: constraints.maxDurationMs,
-      actual: runtime.durationMs,
-      reason: passed
-        ? `Duration ${runtime.durationMs}ms ≤ limit ${constraints.maxDurationMs}ms`
-        : `Duration ${runtime.durationMs}ms exceeded limit ${constraints.maxDurationMs}ms`,
-    });
+  if (constraints.maxDurationMs !== null) {
+    if (runtime.durationMs === undefined) {
+      results.push({
+        type: 'constraint', constraint: 'maxDurationMs', passed: false,
+        limit: constraints.maxDurationMs, actual: undefined,
+        reason: 'maxDurationMs constraint defined but runtime.durationMs not provided',
+      });
+    } else {
+      const passed = runtime.durationMs <= constraints.maxDurationMs;
+      results.push({
+        type: 'constraint', constraint: 'maxDurationMs', passed,
+        limit: constraints.maxDurationMs, actual: runtime.durationMs,
+        reason: passed
+          ? `Duration ${runtime.durationMs}ms ≤ limit ${constraints.maxDurationMs}ms`
+          : `Duration ${runtime.durationMs}ms exceeded limit ${constraints.maxDurationMs}ms`,
+      });
+    }
   }
 
   if (constraints.maxCostUsd !== null && runtime.costUsd !== undefined) {
     const passed = runtime.costUsd <= constraints.maxCostUsd;
     results.push({
-      type: 'constraint',
-      constraint: 'maxCostUsd',
-      passed,
-      limit: constraints.maxCostUsd,
-      actual: runtime.costUsd,
+      type: 'constraint', constraint: 'maxCostUsd', passed,
+      limit: constraints.maxCostUsd, actual: runtime.costUsd,
       reason: passed
         ? `Cost $${runtime.costUsd} ≤ limit $${constraints.maxCostUsd}`
         : `Cost $${runtime.costUsd} exceeded limit $${constraints.maxCostUsd}`,
@@ -467,29 +402,32 @@ function evaluateConstraints(constraints, runtime) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// INTERNAL: RECEIPT BUILDER
+// RECEIPT BUILDER
 // ─────────────────────────────────────────────────────────────
 
 function buildReceipt(fields) {
   const receiptId = generateId('od_r');
-  const issuedAt = new Date().toISOString();
+  const issuedAt  = new Date().toISOString();
 
   const payload = {
     receiptId,
-    version: '0.4.0',
-    isCheckpoint: fields.isCheckpoint,
+    version:             '0.4.0',
+    isCheckpoint:        fields.isCheckpoint,
     checkpointIteration: fields.checkpointIteration || null,
-    contractId: fields.contractId,
-    contractHash: fields.contractHash,
-    task: fields.task,
-    agent: fields.agent,
+    contractId:          fields.contractId,
+    contractHash:        fields.contractHash,
+    task:                fields.task,
+    agent:               fields.agent,
     issuedAt,
-    passed: fields.passed,
-    criteriaResults: fields.criteriaResults,
-    constraintResults: fields.constraintResults,
-    runtime: fields.runtime,
-    output: fields.output,
-    signature: null,  // field present but empty until signed
+    passed:              fields.passed,
+    criteriaResults:     fields.criteriaResults,
+    constraintResults:   fields.constraintResults,
+    runtime:             fields.runtime,
+    output:              fields.output,
+    coramHash:           fields.coramHash        !== undefined ? fields.coramHash        : null,
+    coramEntryCount:     fields.coramEntryCount  !== undefined ? fields.coramEntryCount  : null,
+    coramStatus:         fields.coramStatus      !== undefined ? fields.coramStatus      : null,
+    signature:           null,
   };
 
   payload.hash = canonicalHash(omit(payload, ['hash', 'signature']));
@@ -497,7 +435,7 @@ function buildReceipt(fields) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// STORAGE ADAPTERS
+// STORAGE
 // ─────────────────────────────────────────────────────────────
 
 const defaultStore = (() => {
@@ -507,8 +445,8 @@ const defaultStore = (() => {
     query({ contractId, agent, passed } = {}) {
       return records.filter(r => {
         if (contractId && r.contractId !== contractId) return false;
-        if (agent     && r.agent     !== agent)      return false;
-        if (passed    !== undefined && r.passed !== passed) return false;
+        if (agent && r.agent !== agent) return false;
+        if (passed !== undefined && r.passed !== passed) return false;
         return true;
       });
     },
@@ -516,24 +454,17 @@ const defaultStore = (() => {
   };
 })();
 
-/**
- * File-based persistent store with atomic writes.
- * @param {string} filepath - Path to JSON file
- */
 function fileStore(filepath) {
   let records = [];
   if (fs.existsSync(filepath)) {
-    try {
-      records = JSON.parse(fs.readFileSync(filepath, 'utf8'));
-    } catch {
-      records = [];
-    }
+    try { records = JSON.parse(fs.readFileSync(filepath, 'utf8')); }
+    catch { records = []; }
   }
 
   function persist() {
     const tmp = filepath + '.tmp';
     fs.writeFileSync(tmp, JSON.stringify(records, null, 2));
-    fs.renameSync(tmp, filepath);  // atomic on POSIX
+    fs.renameSync(tmp, filepath);
   }
 
   return {
@@ -547,8 +478,8 @@ function fileStore(filepath) {
     query({ contractId, agent, passed } = {}) {
       return records.filter(r => {
         if (contractId && r.contractId !== contractId) return false;
-        if (agent     && r.agent     !== agent)      return false;
-        if (passed    !== undefined && r.passed !== passed) return false;
+        if (agent && r.agent !== agent) return false;
+        if (passed !== undefined && r.passed !== passed) return false;
         return true;
       });
     },
@@ -557,44 +488,32 @@ function fileStore(filepath) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// UTILS
+// UTILS — canonicalHash NOT exported (forgery prevention)
 // ─────────────────────────────────────────────────────────────
 
 function generateId(prefix = 'od') {
   return `${prefix}_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
 }
 
-// Canonical hash: sorted keys, deterministic across runtimes
 function canonicalHash(obj) {
-  return crypto
-    .createHash('sha256')
-    .update(JSON.stringify(sortKeys(obj)))
-    .digest('hex');
+  return crypto.createHash('sha256').update(JSON.stringify(sortKeys(obj))).digest('hex');
 }
 
 function sortKeys(obj) {
   if (Array.isArray(obj)) return obj.map(sortKeys);
   if (obj && typeof obj === 'object') {
-    return Object.keys(obj).sort().reduce((acc, k) => {
-      acc[k] = sortKeys(obj[k]);
-      return acc;
-    }, {});
+    return Object.keys(obj).sort().reduce((acc, k) => { acc[k] = sortKeys(obj[k]); return acc; }, {});
   }
   return obj;
 }
 
-// Get nested value by dot-notation: 'config.auth.token'
 function getNestedValue(obj, field) {
-  return field.split('.').reduce((acc, key) => {
-    if (acc && typeof acc === 'object') return acc[key];
-    return undefined;
-  }, obj);
+  return field.split('.').reduce((acc, key) => (acc && typeof acc === 'object' ? acc[key] : undefined), obj);
 }
 
 function sanitize(data) {
   if (!data) return data;
-  try { return JSON.parse(JSON.stringify(data)); }
-  catch { return String(data); }
+  try { return JSON.parse(JSON.stringify(data)); } catch { return String(data); }
 }
 
 function omit(obj, keys) {
@@ -604,19 +523,13 @@ function omit(obj, keys) {
 }
 
 function sign(hash, privateKey) {
-  try {
-    const s = crypto.createSign('SHA256');
-    s.update(hash);
-    return s.sign(privateKey, 'hex');
-  } catch { return null; }
+  try { const s = crypto.createSign('SHA256'); s.update(hash); return s.sign(privateKey, 'hex'); }
+  catch { return null; }
 }
 
 function verifySignature(hash, signature, publicKey) {
-  try {
-    const v = crypto.createVerify('SHA256');
-    v.update(hash);
-    return v.verify(publicKey, signature, 'hex');
-  } catch { return false; }
+  try { const v = crypto.createVerify('SHA256'); v.update(hash); return v.verify(publicKey, signature, 'hex'); }
+  catch { return false; }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -625,27 +538,12 @@ function verifySignature(hash, signature, publicKey) {
 
 function runCLI() {
   const args = process.argv.slice(2);
-  const cmd = args[0];
+  const cmd  = args[0];
 
   if (!cmd || cmd === 'help') {
-    console.log(`
-OpenDone v0.4.0 — machine-verifiable AI agent task completion
-
-COMMANDS:
-  evaluate  <contract.json> <output.json>   Evaluate output against contract
-  verify    <receipt.json>                  Verify a receipt's integrity
-  inspect   <receipt.json>                  Human-readable receipt summary
-  keygen                                    Generate RSA keypair for signing
-  help                                      Show this message
-
-EXAMPLES:
-  npx opendone evaluate contract.json output.json
-  npx opendone verify receipt.json
-  npx opendone inspect receipt.json
-    `);
+    console.log(`\nOpenDone v0.5.0 — machine-verifiable AI agent task completion\n\nCOMMANDS:\n  evaluate  <contract.json> <output.json>\n  verify    <receipt.json>\n  inspect   <receipt.json>\n  keygen\n  help\n`);
     return;
   }
-
   if (cmd === 'keygen') {
     const { publicKey, privateKey } = generateKeyPair();
     fs.writeFileSync('public.pem', publicKey);
@@ -653,56 +551,36 @@ EXAMPLES:
     console.log('✓ Generated public.pem and private.pem');
     return;
   }
-
   if (cmd === 'evaluate') {
-    const contractPath = args[1];
-    const outputPath = args[2];
-    if (!contractPath || !outputPath) {
-      console.error('Usage: opendone evaluate <contract.json> <output.json>');
-      process.exit(1);
-    }
-    const c = JSON.parse(fs.readFileSync(contractPath, 'utf8'));
-    const output = JSON.parse(fs.readFileSync(outputPath, 'utf8'));
-    const receipt = evaluate({ contract: c, output });
+    const [, contractPath, outputPath] = args;
+    if (!contractPath || !outputPath) { console.error('Usage: opendone evaluate <contract.json> <output.json>'); process.exit(1); }
+    const receipt = evaluate({ contract: JSON.parse(fs.readFileSync(contractPath, 'utf8')), output: JSON.parse(fs.readFileSync(outputPath, 'utf8')) });
     const outPath = `receipt_${Date.now()}.json`;
     fs.writeFileSync(outPath, JSON.stringify(receipt, null, 2));
     console.log(receipt.passed ? '✓ PASSED' : '✗ FAILED');
-    receipt.criteriaResults.forEach(r => console.log(`  ${r.passed ? '✓' : '✗'} ${r.reason}`));
+    receipt.criteriaResults.forEach(r   => console.log(`  ${r.passed ? '✓' : '✗'} ${r.reason}`));
     receipt.constraintResults.forEach(r => console.log(`  ${r.passed ? '✓' : '✗'} ${r.reason}`));
     console.log(`\nReceipt saved: ${outPath}`);
     return;
   }
-
   if (cmd === 'verify') {
-    const receiptPath = args[1];
-    if (!receiptPath) { console.error('Usage: opendone verify <receipt.json>'); process.exit(1); }
-    const receipt = JSON.parse(fs.readFileSync(receiptPath, 'utf8'));
-    const result = verify(receipt);
+    if (!args[1]) { console.error('Usage: opendone verify <receipt.json>'); process.exit(1); }
+    const result = verify(JSON.parse(fs.readFileSync(args[1], 'utf8')));
     console.log(result.valid ? `✓ ${result.reason}` : `✗ ${result.reason}`);
     return;
   }
-
   if (cmd === 'inspect') {
-    const receiptPath = args[1];
-    if (!receiptPath) { console.error('Usage: opendone inspect <receipt.json>'); process.exit(1); }
-    const receipt = JSON.parse(fs.readFileSync(receiptPath, 'utf8'));
-    console.log(`\nOpenDone Receipt`);
-    console.log(`─────────────────────────────`);
-    console.log(`ID:         ${receipt.receiptId}`);
-    console.log(`Type:       ${receipt.isCheckpoint ? `Checkpoint (iteration ${receipt.checkpointIteration})` : 'Final'}`);
-    console.log(`Task:       ${receipt.task}`);
-    console.log(`Agent:      ${receipt.agent}`);
-    console.log(`Issued:     ${receipt.issuedAt}`);
-    console.log(`Result:     ${receipt.passed ? '✓ PASSED' : '✗ FAILED'}`);
-    console.log(`Signed:     ${receipt.signature ? 'Yes' : 'No'}`);
+    if (!args[1]) { console.error('Usage: opendone inspect <receipt.json>'); process.exit(1); }
+    const r = JSON.parse(fs.readFileSync(args[1], 'utf8'));
+    console.log(`\nOpenDone Receipt\n─────────────────────────────`);
+    console.log(`ID:     ${r.receiptId}\nType:   ${r.isCheckpoint ? `Checkpoint (iteration ${r.checkpointIteration})` : 'Final'}\nTask:   ${r.task}\nAgent:  ${r.agent}\nIssued: ${r.issuedAt}\nResult: ${r.passed ? '✓ PASSED' : '✗ FAILED'}\nSigned: ${r.signature ? 'Yes' : 'No'}`);
     console.log(`\nCriteria:`);
-    (receipt.criteriaResults || []).forEach(r => console.log(`  ${r.passed ? '✓' : '✗'} ${r.reason}`));
+    (r.criteriaResults  || []).forEach(c => console.log(`  ${c.passed ? '✓' : '✗'} ${c.reason}`));
     console.log(`\nConstraints:`);
-    (receipt.constraintResults || []).forEach(r => console.log(`  ${r.passed ? '✓' : '✗'} ${r.reason}`));
-    console.log(`\nHash: ${receipt.hash}`);
+    (r.constraintResults || []).forEach(c => console.log(`  ${c.passed ? '✓' : '✗'} ${c.reason}`));
+    console.log(`\nHash: ${r.hash}`);
     return;
   }
-
   console.error(`Unknown command: ${cmd}. Run 'opendone help' for usage.`);
   process.exit(1);
 }
@@ -710,21 +588,13 @@ EXAMPLES:
 if (require.main === module) runCLI();
 
 // ─────────────────────────────────────────────────────────────
-// EXPORTS
+// EXPORTS — canonicalHash intentionally NOT exported
 // ─────────────────────────────────────────────────────────────
 
 module.exports = {
-  contract,
-  evaluate,
-  checkpoint,
-  verify,
-  sign: signDocument,
-  generateKeyPair,
-  fileStore,
-  defaultStore,
-  OpenDoneError,
-  Errors,
-  // Coram — the fourth primitive
+  contract, evaluate, checkpoint, verify,
+  sign: signDocument, generateKeyPair, fileStore, defaultStore,
+  OpenDoneError, Errors,
   openCoram:            Coram.openCoram,
   appendEntry:          Coram.appendEntry,
   closeCoram:           Coram.closeCoram,

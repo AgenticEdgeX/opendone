@@ -1,273 +1,273 @@
-# OpenDone Specification v0.4.0
+# OpenDone Specification
+**Version 0.5.0**
 
-**A portable standard for machine-verifiable AI agent task completion.**
-
----
-
-## The Problem
-
-When you delegate a task to an AI agent, there is currently no standard way to express what "done" means, no deterministic way to evaluate whether the agent achieved it, and no tamper-evident proof that the work was completed correctly.
-
-Every agent platform solves this differently. Most don't solve it at all.
-
-The result: agents self-report completion, humans manually review output, and there is no portable, auditable record that the task met its stated criteria.
+Open standard for machine-verifiable AI agent task completion.
 
 ---
 
-## What OpenDone Does
+## Overview
 
-OpenDone defines four primitives:
+OpenDone defines five primitives that together make AI agent task completion auditable, portable, and tamper-evident.
 
-1. **Contract** — a machine-readable definition of what "done" means, written before the agent starts
-2. **Receipt** — a tamper-evident, signed record of what happened and whether criteria were met
-3. **Verify** — deterministic evaluation: same contract + same output = same verdict, every time
-4. **Coram** — a contract-anchored, append-only, hash-chained witness record of every agent action during a task, written by infrastructure outside the executing agent
+A **Contract** defines what done means before the agent runs. An **Evaluate** pass produces a **Receipt** — a cryptographically hashed record of which criteria passed and which didn't. **Verify** confirms the receipt hasn't been tampered with. **Coram** records every agent action in a hash-chained witness log bound to the governing contract. **Umbra** sits between the agent and its tools, enforcing policy on every tool call before it executes.
 
-OpenDone does **not** define how agents execute tasks, which LLM to use, how agents communicate, or how to rate agent quality. It defines only the completion layer.
+Zero dependencies. MIT licensed. Works with any agent framework.
 
 ---
 
-## What OpenDone Does NOT Do
+## Primitives
 
-- It is not an agent framework or orchestration layer
-- It is not an observability or tracing platform
-- It is not an agent identity system (though receipts can be signed by any identity scheme)
-- It is not a quality evaluation system (it evaluates deterministic criteria, not subjective quality)
-- It does not replace human review for high-stakes decisions
+### 1. Contract
 
----
+A machine-readable definition of the task, success criteria, and runtime constraints. Created before the agent runs.
 
-## Core Concepts
-
-### The Contract
-
-A contract is a JSON document that specifies:
-
-- **task** — human-readable description of what the agent should accomplish
-- **criteria** — machine-verifiable conditions the output must satisfy
-- **constraints** — runtime boundaries the agent must operate within
-- **expiresAt** — optional deadline after which the contract is invalid
-- **hash** — SHA-256 of the canonical contract, for tamper detection
-- **signature** — optional RSA signature binding the contract to its issuer
-
-```json
-{
-  "contractId": "od_c_1748294000000_a1b2c3d4e5f6",
-  "version": "0.4.0",
-  "task": "Process all pending invoices and return confirmation",
-  "agent": "invoice-processor-v2",
-  "criteria": {
-    "required": ["invoiceIds", "totalProcessed", "status"],
-    "conditions": [
-      { "field": "status",         "operator": "===", "value": "complete" },
-      { "field": "totalProcessed", "operator": ">",   "value": 0 },
-      { "field": "errors",         "operator": "===", "value": 0 }
+```js
+const contract = od.contract({
+  task: 'Summarize Q1 earnings report',
+  criteria: {
+    required: ['summary'],
+    conditions: [
+      { field: 'confidence', op: '>=', value: 0.8 },
+      { field: 'summary',    op: 'includes', value: 'revenue' }
     ]
   },
-  "constraints": {
-    "maxIterations":  50,
-    "maxDurationMs":  30000,
-    "maxCostUsd":     0.10,
-    "checkpointEvery": 10
+  constraints: {
+    maxDurationMs: 30000,
+    maxIterations: 10
   },
-  "createdAt": "2026-01-01T00:00:00.000Z",
-  "expiresAt": "2026-01-01T01:00:00.000Z",
-  "hash": "a3f1...",
-  "signature": null
-}
+  expiresIn: 86400  // seconds
+})
 ```
 
-### The Receipt
+**Fields:**
+- `contractId` — unique identifier
+- `task` — human-readable task description
+- `criteria.required` — output fields that must be present and non-empty
+- `criteria.conditions` — deterministic conditions on output fields
+- `constraints` — runtime limits enforced at evaluate time
+- `expiresIn` / `expiresAt` — contract validity window
+- `hash` — SHA-256 of the contract contents
+- `signature` — optional RSA signature (via `od.sign()`)
+- `specVersion` — `"0.5.0"`
 
-A receipt is produced after evaluation. It is the proof of completion.
+**Supported operators:** `===`, `!==`, `>`, `>=`, `<`, `<=`, `includes`, `matches`, `exists`, `typeof`
 
-Two types exist:
-- **Final receipt** — produced after the task completes, evaluates all criteria
-- **Checkpoint receipt** — produced mid-execution, evaluates only constraints
+All operators are deterministic. No LLM evaluation. Same input always produces the same verdict.
 
-```json
-{
-  "receiptId": "od_r_1748294000000_f6e5d4c3b2a1",
-  "version": "0.4.0",
-  "isCheckpoint": false,
-  "checkpointIteration": null,
-  "contractId": "od_c_1748294000000_a1b2c3d4e5f6",
-  "contractHash": "a3f1...",
-  "task": "Process all pending invoices and return confirmation",
-  "agent": "invoice-processor-v2",
-  "issuedAt": "2026-01-01T00:00:45.000Z",
-  "passed": true,
-  "criteriaResults": [
-    { "type": "required",   "field": "invoiceIds",     "passed": true,  "reason": "Field 'invoiceIds' present" },
-    { "type": "required",   "field": "totalProcessed", "passed": true,  "reason": "Field 'totalProcessed' present" },
-    { "type": "required",   "field": "status",         "passed": true,  "reason": "Field 'status' present" },
-    { "type": "condition",  "field": "status",         "passed": true,  "reason": "status === \"complete\" ✓ (got \"complete\")" },
-    { "type": "condition",  "field": "totalProcessed", "passed": true,  "reason": "totalProcessed > 0 ✓ (got 12)" },
-    { "type": "condition",  "field": "errors",         "passed": true,  "reason": "errors === 0 ✓ (got 0)" }
-  ],
-  "constraintResults": [
-    { "type": "constraint", "constraint": "maxIterations", "passed": true, "limit": 50,    "actual": 23, "reason": "Iterations 23 ≤ limit 50" },
-    { "type": "constraint", "constraint": "maxCostUsd",    "passed": true, "limit": 0.10,  "actual": 0.04, "reason": "Cost $0.04 ≤ limit $0.10" }
-  ],
-  "runtime": { "iterations": 23, "durationMs": 12400, "costUsd": 0.04 },
-  "output": { "invoiceIds": ["INV-001", "INV-002"], "totalProcessed": 12, "status": "complete", "errors": 0 },
-  "hash": "b7c2...",
-  "signature": null
-}
+**Security:** Contract objects are deeply frozen at creation. Fields cannot be mutated post-signing.
+
+---
+
+### 2. Evaluate
+
+Runs the agent's output against the contract. Produces a Receipt.
+
+```js
+const receipt = od.evaluate({
+  contract,
+  output: {
+    summary: 'Q1 revenue up 12% YoY...',
+    confidence: 0.94
+  },
+  agent: 'summarizer-v2',
+  runtime: {
+    durationMs: 4200,
+    iterations: 3
+  }
+})
+```
+
+**Receipt fields:**
+- `receiptId` — unique identifier
+- `contractId` / `contractHash` — binding to the governing contract
+- `status` — `passed` | `partial` | `failed` | `expired`
+- `score` — 0–1, ratio of criteria passed
+- `verifiedCriteria` — list of passing criteria
+- `violations` — list of failing criteria with reasons
+- `hash` — SHA-256 of the receipt contents
+- `signature` — optional RSA signature
+
+**Notes:**
+- If `runtime` is omitted and the contract defines `maxDurationMs` or `maxIterations`, those are recorded as constraint violations.
+- `required` fields must be non-null and non-blank (whitespace-only fails).
+- Numeric operators (`>`, `>=`, `<`, `<=`) require the actual value to be `typeof === 'number'`.
+- Unknown operators fail closed (violation, not pass).
+- The `matches` operator validates regex patterns for safety before execution.
+
+---
+
+### 3. Verify
+
+Deterministic verification of a receipt's integrity.
+
+```js
+const result = od.verify(receipt)
+// { valid: true, status: 'passed', score: 0.94 }
+
+// With signature verification
+const result = od.verify(receipt, publicKey)
+```
+
+Verify recomputes the receipt hash from its fields and compares it to the stored hash. Any field-level tampering — including status, score, violations, or contractHash — is detected.
+
+Signature verification is optional. An unsigned receipt can still be hash-verified. A signed receipt guarantees authorship in addition to integrity.
+
+---
+
+### 4. Coram
+
+An append-only, hash-chained witness record of every agent action, bound to the governing contract. Written by infrastructure. The agent never sees it.
+
+```js
+const coram = od.openCoram({ contract, agentId: 'agent-001' })
+
+od.appendEntry(coram, {
+  action: 'tool.call',
+  tool:   'web_search',
+  input:  { query: 'Q1 earnings AAPL' },
+  result: { ... }
+})
+
+// Verify the chain is intact
+od.verifyCoram(coram, receipt)
+```
+
+Each entry includes:
+- `index` — position in the chain
+- `action`, `tool`, `input`, `result`, `source`, `timestamp`
+- `prevHash` — hash of the previous entry
+- `hash` — SHA-256 of this entry's fields
+
+**Chain verification** recomputes the genesis hash from `coramId`, `contractId`, and `startedAt`, then walks every entry confirming hash integrity and chain links. Swapping `coramId` or reordering entries is detected.
+
+**Loop detection** is available via `coram.detectLoop(threshold)`.
+
+---
+
+### 5. Umbra
+
+The enforcement layer. Sits between the agent and its tools. Checks every tool call against policy before it executes. The agent never sees it.
+
+```js
+const umbra = od.openUmbra({
+  contract,
+  coram,
+  preset: 'sensitive',        // explore | operate | sensitive | custom
+  overrides: {
+    loopThreshold: 2,
+    onLoop: 'realign',        // realign | compress | pause | throw
+    onHumanApproval: async (violation) => { ... },
+    blocklist: ['exec_shell', 'send_email_external']
+  }
+})
+
+// Before every tool call:
+await umbra.check({ tool: 'web_search', input: { query: '...' } })
+// throws UmbraViolationError on policy breach (enforce mode)
+// returns warning object (warn mode)
+// logs and passes (audit mode)
+```
+
+**Three modes:**
+
+| Mode | Behavior |
+|---|---|
+| `enforce` | Throws `UmbraViolationError` on violation — hard stop |
+| `warn` | Returns warning object, continues — operator decides |
+| `audit` | Post-hoc only — logs everything, blocks nothing |
+
+**Preset tiers:**
+
+| Preset | Mode | Loop threshold |
+|---|---|---|
+| `explore` | warn | 5 |
+| `operate` | enforce | 3 |
+| `sensitive` | enforce | 2 |
+
+**Policy checks (in order):**
+1. Allowlist — if set, tool must be in the list
+2. Blocklist — tool must not be in the list
+3. Contract scope — if `contract.allowedTools` is defined, tool must be in scope
+
+**Loop enforcement:** Loop threshold always throws (or triggers corrective action) regardless of mode. A stuck agent is a factual determination, not a policy one.
+
+**Corrective action stack (`onLoop`):**
+
+| Action | Behavior |
+|---|---|
+| `realign` | Injects goal realignment directive from contract |
+| `compress` | Injects Coram digest — tools tried, constraints remaining |
+| `pause` | Calls `onHumanApproval` — human in the loop |
+| `throw` | Throws `UmbraLoopError` — agent halted |
+
+**Coram integration:** Every passing tool call is automatically appended to Coram. Blocked calls are never logged.
+
+**Tool name normalization:** All tool names are normalized before comparison — lowercased, trimmed, zero-width characters stripped, NFC normalized. Prevents case variation and whitespace bypass attacks.
+
+---
+
+## Signing
+
+```js
+const { publicKey, privateKey } = od.generateKeyPair()
+
+// Sign contract
+const signedContract = od.sign(contract, privateKey)
+
+// Sign receipt (pass privateKey to evaluate)
+const receipt = od.evaluate({ contract: signedContract, output, agent, privateKey })
+
+// Verify signature
+od.verify(receipt, publicKey)
 ```
 
 ---
 
-## Criteria Reference
+## Complete flow
 
-### Required Fields
-
-Asserts that a field exists and is non-null in the output.
-Supports dot-notation for nested fields: `"config.auth.token"`
-
-```json
-{ "required": ["invoiceIds", "status", "config.auth.token"] }
+```
+Contract (define done)
+    ↓
+Coram (open witness record)     Umbra (open enforcement layer)
+    ↓                               ↓
+    ←──────── agent tool calls ─────→
+    ↓  (Umbra checks each call)     ↓
+    ↓  (passing calls → Coram)      ↓
+Evaluate (agent output vs contract)
+    ↓
+Receipt (tamper-evident verdict)
+    ↓
+Verify (anyone, anywhere, no dependencies)
 ```
 
-### Conditions
+---
 
-Evaluates a field against a value using an operator.
+## Security model
 
-| Operator     | Description                                 | Example value |
-|-------------|---------------------------------------------|---------------|
-| `>`         | Greater than                                | `0`           |
-| `<`         | Less than                                   | `100`         |
-| `>=`        | Greater than or equal                       | `1`           |
-| `<=`        | Less than or equal                          | `60000`       |
-| `===`       | Strict equality                             | `"complete"`  |
-| `!==`       | Strict inequality                           | `"error"`     |
-| `includes`  | String contains substring                   | `"@"`         |
-| `startsWith`| String starts with prefix                   | `"INV-"`      |
-| `endsWith`  | String ends with suffix                     | `".pdf"`      |
-| `matches`   | String matches regular expression           | `"^[0-9]+$"`  |
-| `typeof`    | JavaScript typeof check                     | `"string"`    |
-| `in`        | Value exists in array                       | `["a","b","c"]`|
+- Receipts are hash-verified. Any field-level tampering is detected.
+- Signed receipts additionally verify authorship.
+- The `_sha256` function is internal — not exported. Receipts cannot be forged by recomputing the hash externally.
+- Contract objects are deeply frozen at creation. Post-creation mutation is blocked.
+- Coram chains are verified end-to-end including genesis hash. CoramId swaps are detected.
+- Umbra tool names are normalized before comparison. String manipulation bypass attempts are blocked.
+- The `matches` operator rejects dangerous regex patterns to prevent ReDoS.
 
 ---
 
-## Constraints Reference
+## What a valid receipt proves
 
-Constraints govern the agent's execution, not just its output.
+A passed receipt with a valid hash confirms:
+- The output was evaluated against the stated contract
+- The specific criteria listed in `verifiedCriteria` passed
+- The receipt has not been modified since evaluation
 
-| Field            | Type    | Description                                           |
-|-----------------|---------|-------------------------------------------------------|
-| `maxIterations` | integer | Maximum agent loop iterations before breach           |
-| `maxDurationMs` | integer | Maximum wall-clock time in milliseconds               |
-| `maxCostUsd`    | number  | Maximum LLM API cost in US dollars                    |
-| `checkpointEvery`| integer| Emit a checkpoint receipt every N iterations          |
+A signed receipt additionally proves the receipt was produced by the holder of the corresponding private key.
 
-When a checkpoint is emitted and constraints are breached, an `OpenDoneError` with code `CONSTRAINT_BREACH` is thrown. The caller is responsible for halting the agent.
-
----
-
-## Verification
-
-Receipt verification is deterministic and requires no external service.
-
-1. Recompute the canonical SHA-256 hash from the receipt payload (excluding `hash` and `signature` fields)
-2. Compare against the stored hash — mismatch = tampered
-3. If a public key is provided, verify the RSA signature against the hash
-
-A receipt is valid if and only if:
-- The hash matches the recomputed hash
-- If signed, the signature verifies against the provided public key
+**What it does not prove:**
+- That the agent actually did what it claimed
+- That the output is factually correct
+- That tools were used appropriately (Coram + Umbra provide this layer)
 
 ---
 
-## Verification Tiers
-
-OpenDone supports three levels of receipt trust, in ascending order:
-
-| Tier | Method | Trust Level |
-|------|--------|-------------|
-| Self | Agent evaluates its own output | Low — self-grading |
-| Independent | Separate process evaluates output | Medium — isolated verification |
-| External | Trusted third-party service signs receipt | High — non-repudiable proof |
-
-The `signature` field on a receipt carries the verifier's identity. An unsigned receipt is self-verified. A receipt signed by a key that is not the executing agent's key is independently verified.
-
----
-
-## Hashing
-
-All hashes use SHA-256 over a canonical JSON representation with:
-- Keys sorted alphabetically at every nesting level
-- No whitespace
-- UTF-8 encoding
-
-This ensures the same logical document produces the same hash regardless of key insertion order or JavaScript runtime.
-
----
-
-## IDs
-
-Contract IDs use prefix `od_c_`. Receipt IDs use prefix `od_r_`.
-Format: `{prefix}_{unix_ms}_{6_random_bytes_hex}`
-
----
-
-## Error Codes
-
-| Code               | When thrown                                          |
-|-------------------|------------------------------------------------------|
-| `INVALID_CONTRACT`  | Contract is malformed or missing required fields    |
-| `CONTRACT_EXPIRED`  | Contract's `expiresAt` is in the past               |
-| `CONSTRAINT_BREACH` | Runtime stats exceed contract constraints at checkpoint — caller must halt agent |
-| `TAMPER_DETECTED`   | Receipt hash does not match recomputed hash         |
-| `SIGNATURE_INVALID` | Signature does not verify against provided key      |
-| `EVALUATION_ERROR`  | Unexpected failure during criteria evaluation — catch and log, do not retry blindly |
-| `STORE_ERROR`       | Storage adapter failed to persist receipt           |
-| `CORAM_TAMPER_DETECTED` | Coram hash chain integrity check failed         |
-| `CORAM_TRACE_MISMATCH`  | Receipt output does not reconcile with Coram inline payloads |
-| `CORAM_INVALID`         | Malformed or missing required Coram fields      |
-| `TOOL_POLICY_VIOLATION` | Agent attempted a blocked or out-of-scope tool call (Gate primitive) |
-
----
-
-## What OpenDone Explicitly Defers
-
-The following are out of scope for this specification and are intentionally left to other standards:
-
-- **Agent identity** — how agents are identified and authenticated (see SPIFFE, DID, AIP)
-- **Inter-agent communication** — how agents call each other (see MCP, A2A)
-- **LLM evaluation** — subjective quality scoring (see Braintrust, Arize, Galileo)
-- **Signing key infrastructure** — certificate chains, revocation (see existing PKI standards)
-- **Payment settlement** — releasing payment on completion (out of scope; receipts are the proof layer)
-
----
-
-## Changelog
-
-### v0.4.0
-- Added **Coram** — the fourth primitive: contract-anchored, append-only, hash-chained witness record of agent actions
-- Coram is infrastructure-written and agent-blind — the executing agent never reads or writes to it
-- Contract anchor: `entry[1].previousHash = SHA-256(contract)` — binds witness record cryptographically to the governing contract
-- Three payload modes: `hashed` (default), `inline` (full payloads), `redacted` (sensitive actions)
-- Loop detection: passive `loopWarning` flag per entry, `loopCount` increments — does not throw, Coram observes
-- Receipt integration: `coramId`, `coramHash`, `coramEntryCount` attached before receipt hashing — Coram is part of the tamper-evident record
-- Full Coram verification: `verifyCoram(coram, receipt)` checks chain integrity, anchor, count, finalHash
-- Four new error codes: `CORAM_TAMPER_DETECTED`, `CORAM_TRACE_MISMATCH`, `CORAM_INVALID`, `TOOL_POLICY_VIOLATION`
-- `coram` parameter added to `evaluate()` — optional, zero breaking changes for existing callers
-
-### v0.3.0
-- Added `constraints` block to contracts (maxIterations, maxDurationMs, maxCostUsd, checkpointEvery)
-- Added `checkpoint()` function for mid-execution receipts
-- Added `CONSTRAINT_BREACH` error with structured detail
-- All operators now documented and validated at contract creation time
-- Canonical hashing (sorted keys) for cross-runtime determinism
-- Atomic file writes in `fileStore` to prevent corruption on crash
-- Dot-notation nested field access in criteria
-
-### v0.2.0
-- Separated contract from receipt
-- Added three-tier verification model
-- Added contract expiry
-- Added RSA signing
-
-### v0.1.0
-- Initial specification
+*OpenDone v0.5.0 — MIT License — github.com/AgenticEdgeX/opendone*

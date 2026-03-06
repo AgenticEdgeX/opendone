@@ -1,10 +1,17 @@
 # OpenDone
 
-**A portable standard for machine-verifiable AI agent task completion.**
+**Open standard for machine-verifiable AI agent task completion.**
 
-You delegate a task to an AI agent. It says it's done. How do you know?
+[![npm version](https://img.shields.io/npm/v/opendone.svg)](https://www.npmjs.com/package/opendone)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-OpenDone gives you a machine-readable contract that defines what "done" means, and a tamper-evident receipt that proves whether the agent met your criteria — deterministically, portably, without trusting the agent's self-report.
+---
+
+There's no standard way to define what "done" means before an agent starts, and no portable proof it was met when it finishes.
+
+OpenDone fixes that. You define success criteria in a machine-readable contract before the agent runs. When it finishes, you get a receipt — hashed, optionally signed — showing which criteria passed and which didn't. Every agent action is recorded in a tamper-evident witness log. Every tool call is checked against policy before it executes.
+
+Zero dependencies. MIT licensed. Works with any agent framework.
 
 ---
 
@@ -14,233 +21,234 @@ OpenDone gives you a machine-readable contract that defines what "done" means, a
 npm install opendone
 ```
 
-Or use directly as a CLI:
+---
 
-```bash
-npx opendone help
-```
+## Five primitives
+
+| Primitive | What it does |
+|---|---|
+| **Contract** | Define what done means before the agent runs |
+| **Evaluate** | Run output against the contract, produce a receipt |
+| **Verify** | Confirm a receipt hasn't been tampered with |
+| **Coram** | Hash-chained witness record of every agent action |
+| **Umbra** | Enforcement layer — checks every tool call against policy |
 
 ---
 
-## Core Concepts
+## Quick start
 
-- **Contract** — define success criteria and runtime constraints _before_ the agent runs
-- **Receipt** — signed, tamper-evident proof of what happened and whether criteria were met
-- **Checkpoint** — mid-execution receipts that verify constraints haven't been breached
-- **Verify** — deterministic: same contract + same output = same verdict, every time
-- **Coram** — contract-anchored, append-only, hash-chained witness record of every agent action, written by infrastructure outside the agent
+```js
+const od = require('opendone')
+const { openCoram } = require('opendone/coram')
+const { openUmbra } = require('opendone/umbra')
 
----
-
-## Quick Start
-
-```javascript
-const OpenDone = require('opendone');
-
-// 1. Define what "done" means
-const contract = OpenDone.contract({
-  task: 'Process invoice batch and return confirmation',
+// 1. Define the task
+const contract = od.contract({
+  task: 'Summarize Q1 earnings report',
   criteria: {
-    required: ['invoiceIds', 'totalProcessed', 'status'],
+    required: ['summary'],
     conditions: [
-      { field: 'status',         operator: '===', value: 'complete' },
-      { field: 'totalProcessed', operator: '>',   value: 0 },
-      { field: 'errors',         operator: '===', value: 0 }
+      { field: 'confidence', op: '>=', value: 0.8 },
+      { field: 'summary',    op: 'includes', value: 'revenue' }
     ]
   },
   constraints: {
-    maxIterations:   50,
-    maxDurationMs:   30000,
-    maxCostUsd:      0.10,
-    checkpointEvery: 10
-  },
-  expiresIn: 3600  // contract expires in 1 hour
-});
+    maxDurationMs: 30000,
+    maxIterations: 10
+  }
+})
 
-// 2. Run your agent (OpenDone is framework-agnostic)
-const agentOutput = await myAgent.run(contract.task);
-
-// 3. Evaluate the output against the contract
-const receipt = OpenDone.evaluate({
+// 2. Open witness record + enforcement layer
+const coram = openCoram({ contract, agentId: 'my-agent-v1' })
+const umbra = openUmbra({
   contract,
-  output: agentOutput,
-  agent: 'my-invoice-agent-v1',
-  runtime: { iterations: 23, durationMs: 12400, costUsd: 0.04 }
-});
+  coram,
+  preset: 'operate',
+  overrides: {
+    blocklist: ['send_email_external', 'exec_shell']
+  }
+})
 
-console.log(receipt.passed);  // true or false
-// receipt is saved, hashed, and ready to verify
+// 3. Agent runs — Umbra checks every tool call before it executes
+await umbra.check({ tool: 'web_search', input: { query: 'Q1 earnings' } })
+await umbra.check({ tool: 'read_file',  input: { path: 'report.pdf' } })
+// Blocked calls throw UmbraViolationError and are never logged to Coram
 
-// 4. Verify integrity later (tamper detection)
-const result = OpenDone.verify(receipt);
-console.log(result.valid);   // true
-console.log(result.reason);  // 'Receipt integrity confirmed'
+// 4. Evaluate agent output against the contract
+const receipt = od.evaluate({
+  contract,
+  output: {
+    summary:    'Q1 revenue up 12% YoY, driven by cloud segment growth.',
+    confidence: 0.94
+  },
+  agent:   'my-agent-v1',
+  runtime: { durationMs: 4200, iterations: 3 }
+})
+
+console.log(receipt.status) // 'passed'
+console.log(receipt.score)  // 1
+
+// 5. Verify the receipt — anyone, anywhere, no dependencies
+const result = od.verify(receipt)
+console.log(result.valid) // true
+
+// 6. Verify the Coram chain is intact and bound to the receipt
+const { verifyCoram } = require('opendone/coram')
+const chainResult = verifyCoram(coram.getRecord(), receipt)
+console.log(chainResult.valid) // true
 ```
 
 ---
 
-## Checkpoints
+## Umbra modes
 
-For long-running tasks, emit checkpoint receipts mid-execution.
-If constraints are breached, an error is thrown so you can halt the agent.
-
-```javascript
-for (let i = 0; i < maxSteps; i++) {
-  await agent.step();
-
-  // Emit checkpoint every N iterations
-  if (i % contract.constraints.checkpointEvery === 0) {
-    try {
-      OpenDone.checkpoint({
-        contract,
-        iteration: i,
-        state: agent.currentState(),
-        runtime: { iterations: i, durationMs: Date.now() - start, costUsd: agent.cost() }
-      });
-    } catch (e) {
-      if (e.code === 'CONSTRAINT_BREACH') {
-        console.error('Agent exceeded constraints, halting:', e.message);
-        break;
-      }
+```js
+const umbra = openUmbra({
+  contract,
+  coram,
+  preset: 'sensitive',   // explore (warn) | operate (enforce) | sensitive (enforce)
+  overrides: {
+    loopThreshold: 2,
+    onLoop: 'realign',   // realign | compress | pause | throw
+    blocklist: ['exec_shell', 'modify_policy'],
+    allowlist: ['web_search', 'read_file', 'write_file'],
+    onHumanApproval: async (event) => {
+      // called on warn-mode violations or pause loop action
+      return true // approve
     }
   }
-}
+})
+
+await umbra.check({ tool: 'web_search', input: { query: '...' } })
+// passes → appended to Coram automatically
+// blocked → throws UmbraViolationError, never touches Coram
+// loop → triggers onLoop action
 ```
 
 ---
 
 ## Signing
 
-Sign contracts and receipts with your RSA private key.
-Anyone with your public key can verify they came from you and weren't modified.
+```js
+const { publicKey, privateKey } = od.generateKeyPair()
 
-```javascript
-const { publicKey, privateKey } = OpenDone.generateKeyPair();
+// Sign the contract
+const signedContract = od.sign(contract, privateKey)
 
-// Sign a contract before handing it to an agent
-const signedContract = OpenDone.sign(contract, privateKey);
+// Sign the receipt at evaluation time
+const receipt = od.evaluate({
+  contract: signedContract,
+  output,
+  agent: 'my-agent',
+  privateKey
+})
 
-// Receipts are signed at evaluation time
-const receipt = OpenDone.evaluate({ contract, output, privateKey });
-
-// Verify signature
-const result = OpenDone.verify(receipt, publicKey);
-```
-
----
-
-## Storage
-
-```javascript
-// Default: in-memory (for testing)
-const receipt = OpenDone.evaluate({ contract, output });
-
-// File-based: atomic writes, persists across restarts
-const store = OpenDone.fileStore('./receipts.json');
-const receipt = OpenDone.evaluate({ contract, output, store });
-
-// Query receipts
-const allReceipts  = store.all();
-const forContract  = store.query({ contractId: contract.contractId });
-const failedOnly   = store.query({ passed: false });
+// Verify signature + hash integrity
+od.verify(receipt, publicKey)
+// { valid: true, status: 'passed', score: 1 }
 ```
 
 ---
 
 ## Coram
 
-Coram is the fourth primitive — a tamper-evident witness record of everything the agent did, cryptographically bound to the contract that governed the run.
+```js
+const { openCoram, verifyCoram } = require('opendone/coram')
 
-```javascript
-const OpenDone = require('opendone');
+const coram = openCoram({ contract, agentId: 'agent-001' })
 
-const contract = OpenDone.contract({
-  task: 'Fetch and summarise 10 articles',
-  criteria: { required: ['summaries', 'count'] }
-});
+// Entries are appended automatically by Umbra for every passing tool call
+// You can also append manually:
+coram.appendEntry({
+  action: 'tool.call',
+  tool:   'web_search',
+  input:  { query: '...' },
+  result: { ... }
+})
 
-// Open a Coram record before the agent starts
-const coram = OpenDone.openCoram({ contract, agentId: 'my-agent-v1' });
+// Verify the full chain
+coram.verifyChain()
+// { valid: true, entries: 4 }
 
-// Your agent loop — append an entry after each tool call
-for (const article of articles) {
-  const result = await agent.fetch(article.url);
-  OpenDone.appendEntry(coram, {
-    action: 'web.fetch',
-    input: { url: article.url },
-    result: { status: result.status, length: result.body.length }
-  });
-}
+// Loop detection
+coram.detectLoop(3)
+// null, or { detected: true, tool: '...', repeatCount: 3 }
 
-// Pass coram into evaluate() — it closes and binds to the receipt automatically
-const receipt = OpenDone.evaluate({ contract, output: agentOutput, coram });
+// Compact digest
+coram.digest()
+// { entryCount, toolsUsed, finalHash, ... }
 
-// Verify the full chain: receipt integrity + Coram witness record
-const result = OpenDone.verifyCoram(coram, receipt);
-console.log(result.valid);         // true
-console.log(result.loopWarnings);  // any repeated actions flagged here
+// Seal (makes append-only permanent)
+coram.seal()
+
+// Bind to receipt
+verifyCoram(coram.getRecord(), receipt)
+// { valid: true, bound: true, entries: 4 }
 ```
 
-Coram is optional — existing `evaluate()` calls work unchanged. The agent never reads or writes Coram directly.
+---
+
+## Operators
+
+All evaluation is deterministic. No LLM calls. Same input always produces the same verdict.
+
+| Operator | Description |
+|---|---|
+| `===` | Strict equality |
+| `!==` | Strict inequality |
+| `>` `>=` `<` `<=` | Numeric comparison (requires `typeof === 'number'`) |
+| `includes` | String includes substring |
+| `matches` | Regex test (safe — dangerous patterns rejected) |
+| `exists` | Field is non-null and non-undefined |
+| `typeof` | Type check |
 
 ---
 
 ## CLI
 
 ```bash
-# Evaluate an output file against a contract file
-npx opendone evaluate contract.json output.json
-
-# Verify a receipt's integrity
+npx opendone evaluate contract.json output.json --sign
 npx opendone verify receipt.json
-
-# Human-readable receipt summary
-npx opendone inspect receipt.json
-
-# Generate an RSA keypair for signing
 npx opendone keygen
+npx opendone inspect receipt.json
 ```
 
 ---
 
-## Criteria Operators
+## What a valid receipt proves
 
-| Operator     | Example                                      |
-|-------------|----------------------------------------------|
-| `===`       | `{ field: 'status', operator: '===', value: 'complete' }` |
-| `>`         | `{ field: 'count', operator: '>', value: 0 }` |
-| `includes`  | `{ field: 'email', operator: 'includes', value: '@' }` |
-| `startsWith`| `{ field: 'id', operator: 'startsWith', value: 'INV-' }` |
-| `matches`   | `{ field: 'phone', operator: 'matches', value: '^[0-9]{10}$' }` |
-| `typeof`    | `{ field: 'amount', operator: 'typeof', value: 'number' }` |
-| `in`        | `{ field: 'tier', operator: 'in', value: ['free','pro','enterprise'] }` |
+- The output was evaluated against the stated contract
+- The criteria listed in `verifiedCriteria` passed at evaluation time
+- The receipt has not been modified since it was produced
 
-Nested fields via dot-notation: `"config.auth.token"`, `"meta.status"`
+A signed receipt additionally proves authorship — it was produced by the holder of the corresponding private key.
+
+**What it does not prove:** that the agent actually did the work, or that outputs are factually correct. Coram + Umbra provide the tool-level audit layer.
 
 ---
 
-## How It's Different
+## Tests
 
-| Tool | What it does |
-|------|-------------|
-| Agent frameworks (LangGraph, CrewAI) | Orchestrate agent execution |
-| Observability (Arize, Braintrust) | Trace and evaluate agent quality |
-| Identity (AIP, SPIFFE) | Authenticate agents |
-| **OpenDone** | Define and verify task completion, portably, deterministically |
-| **OpenDone Coram** | Tamper-evident witness record bound to the governing contract — not just a log |
-
-OpenDone sits between execution and trust. It doesn't compete with any of these — it plugs into all of them.
+```bash
+npm test
+# node test.js        → 20/20
+# node test-coram.js  → 41/41
+# node test-integration.js → 65/65
+```
 
 ---
 
-## Spec
+## Roadmap
 
-The full specification lives in [SPEC.md](./SPEC.md).
-
-OpenDone is an open standard. The spec is the product. Implementations, extensions, and integrations are welcome.
+| Status | Item |
+|---|---|
+| ✓ | Contract / Evaluate / Verify |
+| ✓ | Coram — hash-chained witness record |
+| ✓ | Umbra — tool policy enforcement |
+| ⏳ | `opendone generate` — NL → contract via LLM |
+| ⏳ | MCP Server — native agent distribution |
+| ⏳ | Receipt Dashboard — visual proof + data moat |
 
 ---
 
-## License
-
-MIT
+MIT License — Copyright 2026 AgenticEdgeX
